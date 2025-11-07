@@ -1,25 +1,26 @@
+import time
 import ultrasonic
 import camera
 
+# Константы
+DIST_THRESHOLD_CM = 20        # расстояние для срабатывания ультразвука
+WHITE_RATIO_THRESHOLD = 0.05  # доля белого для камеры
+
 def main():
-    
-    # Получаем данные с датчиков
-    ultrasonic_detected = ultrasonic.detect()  # 1 — видит, 0 — нет
-    camera_detected = camera.detect_obstacle_by_color()  # 1 — видит, 0 — нет
 
-    print(f"Ультразвук: {ultrasonic_detected}")
-    print(f"Камера: {camera_detected}")
+    ultrasonic_result = ultrasonic.detect(threshold_cm=DIST_THRESHOLD_CM)
+    camera_result = camera.detect_obstacle_by_color(white_ratio_thr=WHITE_RATIO_THRESHOLD)
 
-    # Проверяем, оба ли видят препятствие
-    if ultrasonic_detected == 1 and camera_detected == 1:
-        print("⚠️  Обнаружено препятствие (оба датчика подтверждают)")
-    elif ultrasonic_detected == 1:
-        print("🔊 Обнаружено препятствие ультразвуком")
-    elif camera_detected == 1:
-        print("📷 Обнаружено препятствие камерой")
+    print("\nРезультаты:")
+    print(f"  Ультразвук: {ultrasonic_result}")
+    print(f"  Камера: {camera_result}")
+
+    if ultrasonic_result and camera_result:
+        print("\n Обнаружено препятствие")
+    elif ultrasonic_result or camera_result:
+        print("\n Возможное препятствие")
     else:
-        print("✅ Препятствий не обнаружено")
+        print("\n Препятствий не обнаружено")
 
 if __name__ == "__main__":
     main()
-

@@ -1,50 +1,45 @@
 import cv2
 import numpy as np
 
-def detect_obstacle_by_color():
+def detect_obstacle_by_color(white_ratio_thr=0.05):
+    """Определяет наличие белого препятствия по видеопотоку
+    Возвращает:
+      True — если белый объект занимает больше white_ratio_thr площади кадра
+      False — если нет
+      None — если камера не доступна"""
+    
     cap = cv2.VideoCapture(0)
-
     if not cap.isOpened():
-        print("Ошибка: камера не найдена.")
-        return
+        print("Ошибка: камера недоступна")
+        return None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # Преобразуем изображение в HSV (удобнее для выделения цветов)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # Диапазон белого цвета (можно подстроить под освещение)
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 40, 255])
-
-        # Маска — выделяем белые области
-        mask = cv2.inRange(hsv, lower_white, upper_white)
-
-        # Считаем, сколько белых пикселей
-        white_area = cv2.countNonZero(mask)
-        total_area = frame.shape[0] * frame.shape[1]
-        white_ratio = white_area / total_area
-
-        # Порог: если белого больше 5% кадра — считаем препятствием
-        if white_ratio > 0.05:
-            print("1 (вижу белое препятствие)")
-        else:
-            print("0 (путь чист)")
-
-        # Показываем картинку (для отладки)
-        cv2.imshow("Frame", frame)
-        cv2.imshow("Mask (white detection)", mask)
-
-        # Нажми q чтобы выйти
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
+    ret, frame = cap.read()
     cap.release()
-    cv2.destroyAllWindows()
+
+    if not ret:
+        print("Ошибка: не удалось получить кадр")
+        return None
+
+    # Переводим в HSV (удобнее выделять цвета)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Диапазон для белого
+    lower_white = np.array([0, 0, 200])
+    upper_white = np.array([180, 25, 255])
+
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+    white_ratio = np.sum(mask > 0) / mask.size
+
+    print(f"Доля белого цвета: {white_ratio:.3f}")
+
+    return white_ratio > white_ratio_thr
 
 
 if __name__ == "__main__":
-    detect_obstacle_by_color()
+    print("Тест камеры:")
+    result = detect_obstacle_by_color(white_ratio_thr=0.05)
+    if result is True:
+        print("Обнаружено белое препятствие")
+    elif result is False:
+        print("Белого препятствия нет")
+    else:
+        print("Ошибка при работе с камерой")
