@@ -1,15 +1,21 @@
-import time
 import ultrasonic
 import camera
 
-# Константы
-DIST_THRESHOLD_CM = 20        # расстояние для срабатывания ультразвука
+DIST_THRESHOLD_CM = 60        # порог расстояния для препятствия
 WHITE_RATIO_THRESHOLD = 0.05  # доля белого для камеры
+NUM_SAMPLES = 3               # измерений для усреднения
+TIMEOUT = 0.02                # таймаут для эха
 
 def main():
+    ultrasonic_result = ultrasonic.detect(
+        threshold_cm=DIST_THRESHOLD_CM,
+        num_samples=NUM_SAMPLES,
+        timeout=TIMEOUT
+    )
 
-    ultrasonic_result = ultrasonic.detect(threshold_cm=DIST_THRESHOLD_CM)
-    camera_result = camera.detect_obstacle_by_color(white_ratio_thr=WHITE_RATIO_THRESHOLD)
+    camera_result = camera.detect_obstacle_by_color(
+        white_ratio_thr=WHITE_RATIO_THRESHOLD
+    )
 
     print("\nРезультаты:")
     print(f"  Ультразвук: {ultrasonic_result}")
