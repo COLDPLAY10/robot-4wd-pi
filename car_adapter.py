@@ -5,7 +5,7 @@ import math
 bot = Raspbot()
 debug = 0
 
-#ехать вперёд вычисляет значения для четырёх моторов
+#РµС…Р°С‚СЊ РІРїРµСЂС‘Рґ РІС‹С‡РёСЃР»СЏРµС‚ Р·РЅР°С‡РµРЅРёСЏ РґР»СЏ С‡РµС‚С‹СЂС‘С… РјРѕС‚РѕСЂРѕРІ
 
 def move_forward(speed):
     l1, l2, r1, r2 = set_deflection(speed, 90)
@@ -17,18 +17,18 @@ def move_forward(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
 
-#eхать вперёд с процентной регулировкой стороны
+#eС…Р°С‚СЊ РІРїРµСЂС‘Рґ СЃ РїСЂРѕС†РµРЅС‚РЅРѕР№ СЂРµРіСѓР»РёСЂРѕРІРєРѕР№ СЃС‚РѕСЂРѕРЅС‹
 
 def move_param_forward(speed, param_percent):
 
-    # защитные приведения
+    # Р·Р°С‰РёС‚РЅС‹Рµ РїСЂРёРІРµРґРµРЅРёСЏ
     s = int(speed)
     if s < 0:
         s = 0
     if s > 255:
         s = 255
 
-    # ограничиваем процент
+    # РѕРіСЂР°РЅРёС‡РёРІР°РµРј РїСЂРѕС†РµРЅС‚
     try:
         p = float(param_percent)
     except Exception:
@@ -38,10 +38,10 @@ def move_param_forward(speed, param_percent):
     if p < -100.0:
         p = -100.0
 
-    # базовые значения моторов для движения вперёд
+    # Р±Р°Р·РѕРІС‹Рµ Р·РЅР°С‡РµРЅРёСЏ РјРѕС‚РѕСЂРѕРІ РґР»СЏ РґРІРёР¶РµРЅРёСЏ РІРїРµСЂС‘Рґ
     l1, l2, r1, r2 = set_deflection(s, 90)
 
-    # если процент 0 — просто ехать вперёд
+    # РµСЃР»Рё РїСЂРѕС†РµРЅС‚ 0 вЂ” РїСЂРѕСЃС‚Рѕ РµС…Р°С‚СЊ РІРїРµСЂС‘Рґ
     if abs(p) < 1e-6:
         bot.Ctrl_Muto(0, _clamp_pwm(l1))
         bot.Ctrl_Muto(1, _clamp_pwm(l2))
@@ -49,9 +49,9 @@ def move_param_forward(speed, param_percent):
         bot.Ctrl_Muto(3, _clamp_pwm(r2))
         return True
 
-    # вычисляем поправку как процент от соответствующей стороны
+    # РІС‹С‡РёСЃР»СЏРµРј РїРѕРїСЂР°РІРєСѓ РєР°Рє РїСЂРѕС†РµРЅС‚ РѕС‚ СЃРѕРѕС‚РІРµС‚СЃС‚РІСѓСЋС‰РµР№ СЃС‚РѕСЂРѕРЅС‹
     if p >= 0:
-        # усиливаем правую сторону
+        # СѓСЃРёР»РёРІР°РµРј РїСЂР°РІСѓСЋ СЃС‚РѕСЂРѕРЅСѓ
         r1_adj = int(round(r1 * (p / 100.0)))
         r2_adj = int(round(r2 * (p / 100.0)))
         bot.Ctrl_Muto(0, _clamp_pwm(l1))
@@ -59,7 +59,7 @@ def move_param_forward(speed, param_percent):
         bot.Ctrl_Muto(2, _clamp_pwm(r1 + r1_adj))
         bot.Ctrl_Muto(3, _clamp_pwm(r2 + r2_adj))
     else:
-        # p < 0: усиливаем левую сторону
+        # p < 0: СѓСЃРёР»РёРІР°РµРј Р»РµРІСѓСЋ СЃС‚РѕСЂРѕРЅСѓ
         pp = abs(p)
         l1_adj = int(round(l1 * (pp / 100.0)))
         l2_adj = int(round(l2 * (pp / 100.0)))
@@ -70,7 +70,7 @@ def move_param_forward(speed, param_percent):
 
     return True
 
-#ехать назад
+#РµС…Р°С‚СЊ РЅР°Р·Р°Рґ
 
 def move_backward(speed):
     l1, l2, r1, r2 = set_deflection(speed, 270)
@@ -82,7 +82,7 @@ def move_backward(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
     
-#ехать влево
+#РµС…Р°С‚СЊ РІР»РµРІРѕ
 
 def move_left(speed):
     l1, l2, r1, r2 = set_deflection(speed, 180)
@@ -94,7 +94,7 @@ def move_left(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
 
-#ехать вправо
+#РµС…Р°С‚СЊ РІРїСЂР°РІРѕ
 
 def move_right(speed):
     l1, l2, r1, r2 = set_deflection(speed, 0)
@@ -106,7 +106,7 @@ def move_right(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
 
-#поворот влево на месте
+#РїРѕРІРѕСЂРѕС‚ РІР»РµРІРѕ РЅР° РјРµСЃС‚Рµ
 
 def rotate_left(speed):
     l1, l2, r1, r2 = set_deflection(speed, 180)
@@ -118,7 +118,7 @@ def rotate_left(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, abs(r2) + 0)
 
-#поворот вправо на месте
+#РїРѕРІРѕСЂРѕС‚ РІРїСЂР°РІРѕ РЅР° РјРµСЃС‚Рµ
 
 def rotate_right(speed):
     l1, l2, r1, r2 = set_deflection(speed, 0)
@@ -130,7 +130,7 @@ def rotate_right(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, -r2 + 0)
 
-#движение по диагонали влево вперёд
+#РґРІРёР¶РµРЅРёРµ РїРѕ РґРёР°РіРѕРЅР°Р»Рё РІР»РµРІРѕ РІРїРµСЂС‘Рґ
 
 def move_diagonal_left_front(speed):
     l1, l2, r1, r2 = set_deflection(speed, 135)
@@ -142,7 +142,7 @@ def move_diagonal_left_front(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
     
-#движение по диагонали влево назад
+#РґРІРёР¶РµРЅРёРµ РїРѕ РґРёР°РіРѕРЅР°Р»Рё РІР»РµРІРѕ РЅР°Р·Р°Рґ
 
 def move_diagonal_left_back(speed):
     l1, l2, r1, r2 = set_deflection(speed, 225)
@@ -154,7 +154,7 @@ def move_diagonal_left_back(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
     
-#движение по диагонали вправо вперёд
+#РґРІРёР¶РµРЅРёРµ РїРѕ РґРёР°РіРѕРЅР°Р»Рё РІРїСЂР°РІРѕ РІРїРµСЂС‘Рґ
 
 def move_diagonal_right_front(speed):
     l1, l2, r1, r2 = set_deflection(speed, 45)
@@ -166,7 +166,7 @@ def move_diagonal_right_front(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
 
-#движение по диагонали вправо назад
+#РґРІРёР¶РµРЅРёРµ РїРѕ РґРёР°РіРѕРЅР°Р»Рё РІРїСЂР°РІРѕ РЅР°Р·Р°Рґ
 
 def move_diagonal_right_back(speed):
     l1, l2, r1, r2 = set_deflection(speed, 315)
@@ -178,7 +178,7 @@ def move_diagonal_right_back(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
     
-#остановка робота
+#РѕСЃС‚Р°РЅРѕРІРєР° СЂРѕР±РѕС‚Р°
 
 def stop_robot():
         bot.Ctrl_Car(0, 0, 0)
@@ -186,7 +186,7 @@ def stop_robot():
         bot.Ctrl_Car(2, 0, 0)
         bot.Ctrl_Car(3, 0, 0)
 
-#безопасная остановка робота 
+#Р±РµР·РѕРїР°СЃРЅР°СЏ РѕСЃС‚Р°РЅРѕРІРєР° СЂРѕР±РѕС‚Р° 
 
 def stop():
     for i in range(4):
@@ -196,7 +196,7 @@ def stop():
         bot.Ctrl_Car(2, 0, 0)
         bot.Ctrl_Car(3, 0, 0)
 
-#расчёт значений для четырёх моторов по направлению
+#СЂР°СЃС‡С‘С‚ Р·РЅР°С‡РµРЅРёР№ РґР»СЏ С‡РµС‚С‹СЂС‘С… РјРѕС‚РѕСЂРѕРІ РїРѕ РЅР°РїСЂР°РІР»РµРЅРёСЋ
 
 def set_deflection(speed, deflection):
     if(speed>255):speed=255
@@ -210,7 +210,7 @@ def set_deflection(speed, deflection):
     r2 = int(vy + vx)
     return l1,l2,r1,r2
     
-#расчёт для компенсации скольжения
+#СЂР°СЃС‡С‘С‚ РґР»СЏ РєРѕРјРїРµРЅСЃР°С†РёРё СЃРєРѕР»СЊР¶РµРЅРёСЏ
 
 def set_deflection_rate(speed, deflection,rate):
     if(speed>255):speed=255
@@ -225,7 +225,7 @@ def set_deflection_rate(speed, deflection,rate):
     r2 = int(vy + vx + vp)
     return l1,l2,r1,r2
 
-#Установка моторов
+#РЈСЃС‚Р°РЅРѕРІРєР° РјРѕС‚РѕСЂРѕРІ
 
 def drifting(speed,deflection,rate):
     l1,l2,r1,r2=set_deflection_rate(speed,deflection,rate)
