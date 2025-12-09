@@ -1,0 +1,10 @@
+.idea
+__pycache__/
+*.pyc
+*.pyo
+
+# Собранные данные
+collected_data/
+obstacle_photos/
+*.jpg
+*.png
