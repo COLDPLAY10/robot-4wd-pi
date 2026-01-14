@@ -1,10 +1,62 @@
-.idea
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Собранные данные
-collected_data/
-obstacle_photos/
-*.jpg
-*.png
+# Виртуальные окружения
+venv/
+ENV/
+env/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Модели (могут быть большими)
+models/*.pth
+models/*.onnx
+models/*.h5
+models/*.pb
+
+# Карты SLAM
+*.pkl
+map_*.pkl
+map_autosave_*.pkl
+
+# Логи
+*.log
+
+# Временные файлы
+*.tmp
+*.bak
+*.swp
+*~
+
+# Изображения и видео
+*.mp4
+*.avi
+dataset/
+
+# OS
+.DS_Store
+Thumbs.db
+

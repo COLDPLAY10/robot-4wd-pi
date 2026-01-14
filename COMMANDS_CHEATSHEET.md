@@ -9,6 +9,40 @@
 
 ---
 
+## Лидар
+
+### Настройка
+```bash
+# Автоматическая настройка UART
+sudo ./setup_lidar.sh
+
+# Диагностика
+python3 diagnose_lidar.py
+
+# Простой тест
+python3 lidar.py
+```
+
+### Использование с лидаром
+```bash
+# Исследование с лидаром
+python3 demo_with_lidar.py explore
+
+# Навигация к точке
+python3 demo_with_lidar.py goto 2.0 1.5
+```
+
+### Без лидара
+```bash
+# Исследование без лидара
+python3 demo_no_lidar.py explore
+
+# Навигация к точке
+python3 demo_no_lidar.py goto 2.0 1.5
+```
+
+---
+
 ## Скрипт 1: Сбор данных (data_collector.py)
 
 ### Базовое использование
