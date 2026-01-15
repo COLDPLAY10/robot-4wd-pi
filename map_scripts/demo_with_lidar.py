@@ -75,9 +75,11 @@ def exploration_with_lidar_demo():
         controller.stop()
 
         # Сохраняем карту
-        print("\n[INFO] Сохранение карты...")
-        controller.save_map("map_with_lidar.png")
-        print("[INFO] Карта сохранена в map_with_lidar.png")
+        map_file = f"map_exploration_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
+        controller.save_map(map_file)
+
+        print(f"\n[INFO] Карта сохранена: {map_file}")
+        print(f"[INFO] Используйте: python3 visualize_map.py --map {map_file}")
 
 
 def goto_with_lidar_demo(target_x: float, target_y: float):
@@ -136,7 +138,13 @@ def goto_with_lidar_demo(target_x: float, target_y: float):
         print("\n[INFO] Остановка по запросу пользователя")
     finally:
         controller.stop()
-        controller.save_map("map_goto_lidar.png")
+
+        # Сохраняем карту
+        map_file = f"map_navigation_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
+        controller.save_map(map_file)
+
+        print(f"\n[INFO] Карта сохранена: {map_file}")
+        print(f"[INFO] Используйте: python3 visualize_map.py --map {map_file}")
 
 
 def main():
