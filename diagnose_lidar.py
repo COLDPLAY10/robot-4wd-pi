@@ -13,7 +13,7 @@ def check_uart_ports():
     print("ПРОВЕРКА UART ПОРТОВ")
     print("="*60)
 
-    ports = ['/dev/ttyAMA0', '/dev/ttyS0', '/dev/ttyUSB0']
+    ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']  # Изменил порядок, сначала USB
     found_ports = []
 
     for port in ports:
@@ -22,19 +22,19 @@ def check_uart_ports():
             found_ports.append(port)
 
             # Проверка прав
-            if os.access(port, os.R_OK | os.W_OK):
-                print(f"  └─ Права доступа: OK")
-            else:
-                print(f"  └─ Права доступа: НЕТ (нужно: sudo chmod 666 {port})")
+            try:
+                if os.access(port, os.R_OK | os.W_OK):
+                    print(f"  └─ Права доступа: OK")
+                else:
+                    print(f"  └─ Права доступа: НЕТ (нужно: sudo chmod 666 {port})")
+            except:
+                print(f"  └─ Не удалось проверить права")
+
         else:
             print(f"✗ {port} не найден")
 
     if not found_ports:
         print("\n⚠ UART порты не найдены!")
-        print("Возможные причины:")
-        print("1. UART не включен в raspi-config")
-        print("2. Драйверы не загружены")
-        print("\nРешение: sudo ./setup_lidar.sh")
         return []
 
     return found_ports
@@ -52,7 +52,6 @@ def check_serial_module():
         return True
     except ImportError:
         print("✗ pyserial не установлен")
-        print("\nУстановка: pip3 install pyserial")
         return False
 
 
@@ -63,9 +62,16 @@ def test_lidar_connection(ports):
     print("="*60)
 
     try:
+        # Пытаемся импортировать драйвер
+        sys.path.append(os.path.dirname(os.path.abspath(__file__)))
         from lidar import LidarDriver
+        print("✓ Драйвер лидара загружен")
     except ImportError as e:
         print(f"✗ Ошибка импорта драйвера: {e}")
+        print(f"  Путь поиска: {sys.path[-1]}")
+        return False
+    except Exception as e:
+        print(f"✗ Другая ошибка импорта: {e}")
         return False
 
     for port in ports:
@@ -73,7 +79,7 @@ def test_lidar_connection(ports):
 
         try:
             # Пробуем разные скорости
-            for baudrate in [230400, 115200, 256000]:
+            for baudrate in [230400, 115200, 256000, 9600]:
                 print(f"  Скорость: {baudrate}...")
 
                 lidar = LidarDriver(port=port, baudrate=baudrate, timeout=2.0)
@@ -83,46 +89,109 @@ def test_lidar_connection(ports):
 
                     # Пробуем читать данные
                     print("  Запуск сканирования...")
-                    lidar.start_scan()
+                    if lidar.start_scan():
+                        print("  ✓ Сканирование запущено")
+                        
+                        # Даем время на сбор данных
+                        time.sleep(2)
+                        
+                        # Проверяем наличие данных
+                        scan = lidar.get_scan()
+                        print(f"  Получено точек: {len(scan) if scan else 0}")
 
-                    time.sleep(2)  # Даем время на сбор данных
+                        if scan and len(scan) > 0:
+                            print(f"  ✓ Данные получены: {len(scan)} точек")
 
-                    scan = lidar.get_scan()
+                            # Показываем примеры данных
+                            print("\n  Примеры данных (первые 3 точки):")
+                            for i, (angle, distance) in enumerate(scan[:3]):
+                                angle_deg = angle * 180 / 3.14159
+                                print(f"    {i+1}. Угол: {angle:.2f}рад ({angle_deg:.1f}°), Расстояние: {distance:.3f}м")
 
-                    if scan and len(scan) > 0:
-                        print(f"  ✓ Данные получены: {len(scan)} точек")
+                            # Проверяем расстояние вперед
+                            front = lidar.get_front_distance()
+                            if front:
+                                print(f"\n  Расстояние вперед (±15°): {front:.2f}м")
+                            else:
+                                print(f"\n  Нет данных вперед")
 
-                        # Показываем примеры данных
-                        print("\n  Примеры данных (первые 5 точек):")
-                        for i, (angle, distance) in enumerate(scan[:5]):
-                            print(f"    {i+1}. Угол: {angle:.2f}рад ({angle*180/3.14159:.1f}°), Расстояние: {distance:.3f}м")
+                            lidar.stop_scan()
+                            lidar.disconnect()
 
-                        # Проверяем ближайшее препятствие
-                        import numpy as np
-                        front = lidar.get_closest_obstacle(-np.pi/6, np.pi/6)
-                        if front:
-                            print(f"\n  Ближайшее препятствие впереди: {front[1]:.2f}м")
-
-                        lidar.disconnect()
-
-                        print("\n" + "="*60)
-                        print("✓ ЛИДАР РАБОТАЕТ КОРРЕКТНО!")
-                        print("="*60)
-                        print(f"\nИспользуйте: port='{port}', baudrate={baudrate}")
-                        return True
+                            print("\n" + "="*60)
+                            print("✓ ЛИДАР РАБОТАЕТ КОРРЕКТНО!")
+                            print("="*60)
+                            print(f"\nИспользуйте: port='{port}', baudrate={baudrate}")
+                            return True
+                        else:
+                            print("  ✗ Данные не получены")
+                            lidar.stop_scan()
+                            lidar.disconnect()
                     else:
-                        print("  ✗ Данные не получены")
+                        print("  ✗ Не удалось запустить сканирование")
                         lidar.disconnect()
                 else:
                     print("  ✗ Не удалось подключиться")
 
         except Exception as e:
             print(f"  ✗ Ошибка: {e}")
+            import traceback
+            print(f"  Детали: {traceback.format_exc()}")
 
     print("\n" + "="*60)
     print("✗ НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К ЛИДАРУ")
     print("="*60)
     return False
+
+
+def check_lidar_raw_data():
+    """Проверка сырых данных лидара"""
+    print("\n" + "="*60)
+    print("ПРОВЕРКА СЫРЫХ ДАННЫХ ЛИДАРА")
+    print("="*60)
+    
+    try:
+        import serial
+        
+        port = '/dev/ttyUSB1'
+        if not os.path.exists(port):
+            print(f"✗ Порт {port} не найден")
+            return False
+            
+        print(f"Открываю {port} на скорости 230400...")
+        
+        # Просто читаем сырые данные без парсинга
+        with serial.Serial(port, 230400, timeout=2.0) as ser:
+            ser.reset_input_buffer()
+            
+            # Отправляем команду старта
+            ser.write(b'\xA5\x60')
+            time.sleep(0.5)
+            
+            # Читаем данные
+            if ser.in_waiting > 0:
+                data = ser.read(ser.in_waiting)
+                print(f"Получено {len(data)} байт:")
+                print(f"HEX: {data.hex()[:100]}...")
+                
+                # Ищем паттерны
+                if b'\xAA\x55' in data:
+                    print("✓ Найден паттерн AA 55")
+                elif b'\xA5\x5A' in data:
+                    print("✓ Найден паттерн A5 5A")
+                else:
+                    print("✗ Неизвестный формат данных")
+                    
+                # Останавливаем
+                ser.write(b'\xA5\x65')
+                return True
+            else:
+                print("✗ Нет данных от лидара")
+                return False
+                
+    except Exception as e:
+        print(f"✗ Ошибка: {e}")
+        return False
 
 
 def print_troubleshooting():
@@ -131,39 +200,35 @@ def print_troubleshooting():
     print("УСТРАНЕНИЕ ПРОБЛЕМ")
     print("="*60)
     print("""
-1. UART не включен:
-   sudo raspi-config
-   → Interface Options → Serial Port
-   → Login shell: NO, Hardware: YES
-   → Reboot
+1. Проверьте подключение кабеля:
+   - Убедитесь, что лидар подключен к USB порту
+   - Попробуйте другой USB порт
 
-2. Нет прав доступа:
-   sudo usermod -a -G dialout $USER
-   sudo chmod 666 /dev/ttyAMA0
-   Затем выйдите и зайдите снова
-
-3. Консоль занимает порт:
-   Запустите: sudo ./setup_lidar.sh
-
-4. Проверьте подключение:
-   - TX лидара → RX (GPIO 15, pin 10) RPi
-   - RX лидара → TX (GPIO 14, pin 8) RPi
-   - VCC → 5V
-   - GND → GND
-
-5. Проверьте питание:
+2. Проверьте питание:
    - Лидар должен светиться
-   - Лидар должен вращаться
+   - Лидар должен издавать звук вращения
 
-6. Попробуйте другой порт:
-   - /dev/ttyAMA0 (основной UART)
-   - /dev/ttyS0 (альтернативный)
-   - /dev/ttyUSB0 (USB адаптер)
+3. Проверьте драйверы USB:
+   - lsusb | grep -i lidar
+   - dmesg | grep ttyUSB
 
-7. Попробуйте другую скорость:
-   - 230400 (стандарт для T-MINI Plus)
-   - 115200 (альтернатива)
-   - 256000 (некоторые модели)
+4. Проверьте права:
+   - sudo chmod 666 /dev/ttyUSB1
+   - sudo usermod -a -G dialout $USER
+
+5. Попробуйте другой порт:
+   - /dev/ttyUSB1 (обычно лидар)
+   - /dev/ttyUSB0
+   - ls -la /dev/ttyUSB*
+
+6. Попробуйте другую скорость:
+   - 230400 (стандарт)
+   - 115200
+   - 256000
+   
+7. Если лидар не вращается:
+   - Проверьте питание 5V
+   - Мотор лидара может быть отключен
     """)
 
 
@@ -179,15 +244,42 @@ def main():
     # Проверка 2: Python модули
     serial_ok = check_serial_module()
 
-    if not ports or not serial_ok:
+    if not ports:
+        print("\n⚠ Порты не найдены, проверяем только сырые данные...")
+        success = check_lidar_raw_data()
+        if not success:
+            print_troubleshooting()
+            sys.exit(1)
+        else:
+            sys.exit(0)
+            
+    if not serial_ok:
+        print("\nУстановите pyserial: pip3 install pyserial")
+        sys.exit(1)
+
+    # Проверка 3: Сначала сырые данные
+    print("\nСначала проверяем сырые данные...")
+    if check_lidar_raw_data():
+        print("✓ Сырые данные есть, проверяем драйвер...")
+    else:
+        print("✗ Нет сырых данных, проблема в подключении")
         print_troubleshooting()
         sys.exit(1)
 
-    # Проверка 3: Подключение лидара
+    # Проверка 4: Подключение через драйвер
     success = test_lidar_connection(ports)
 
     if not success:
+        print("\nНе удалось получить данные через драйвер, но сырые данные есть.")
+        print("Возможно, проблема в парсинге данных.")
         print_troubleshooting()
+        
+        # Проверка версии драйвера
+        print("\nПроверьте файл lidar.py:")
+        print("1. Убедитесь, что метод _reading_thread() корректно парсит данные")
+        print("2. Проверьте формат пакетов: AA 55 ...")
+        print("3. Уменьшите минимальное расстояние в фильтре: if 0.05 < distance_m < 6.0")
+        
         sys.exit(1)
 
     print("\n✓ Диагностика завершена успешно!")
@@ -196,4 +288,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -5,8 +5,12 @@
 """
 
 import sys
+import os
 import time
 import signal
+
+# ИСПРАВЛЕНО: Добавляем путь к родительской директории
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from map.navigation_controller import NavigationController
 import car_adapter as ca

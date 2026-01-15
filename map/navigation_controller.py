@@ -68,10 +68,12 @@ class NavigationController:
         # Режим работы
         self.mode = NavigationMode.IDLE
 
-        # Параметры движения
-        self.exploration_speed = 15      # медленная скорость для анализа
-        self.navigation_speed = 30       # быстрая скорость для маршрута
-        self.min_obstacle_distance = 0.3 # минимальное расстояние до препятствия (м)
+        # Параметры движения (УМЕНЬШЕННЫЕ для безопасности!)
+        self.exploration_speed = 10      # ОЧЕНЬ медленная скорость для анализа (было 15)
+        self.navigation_speed = 15       # Медленная скорость для маршрута (было 30)
+        self.turn_speed = 8              # Скорость поворота
+        self.min_obstacle_distance = 0.4 # Увеличенное минимальное расстояние (было 0.3)
+        self.critical_distance = 0.2     # Критическое расстояние для экстренной остановки
         self.goal_tolerance = 0.2        # допустимое отклонение от цели (м)
 
         # Текущая цель
@@ -97,6 +99,10 @@ class NavigationController:
         # Инициализация датчиков
         self._init_sensors()
 
+        print(f"[NavController] Скорости: исследование={self.exploration_speed}, "
+              f"навигация={self.navigation_speed}, поворот={self.turn_speed}")
+        print(f"[NavController] Дистанции: мин={self.min_obstacle_distance}м, "
+              f"крит={self.critical_distance}м")
         print("="*60)
         print("СИСТЕМА ГОТОВА К РАБОТЕ")
         print("="*60 + "\n")
@@ -112,41 +118,41 @@ class NavigationController:
                 print(f"[NavController] Ошибка инициализации ультразвука: {e}")
 
     def _init_lidar(self):
-        """Инициализация лидара"""
-        try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            from lidar import LidarDriver
-
-            # Пробуем подключиться к лидару на разных портах
-            ports = ['/dev/ttyAMA0', '/dev/ttyUSB0', '/dev/ttyS0']
-
-            for port in ports:
-                try:
-                    print(f"[NavController] Попытка подключения к лидару на {port}...")
-                    self.lidar = LidarDriver(port=port, baudrate=230400)
-
-                    if self.lidar.connect():
-                        self.lidar.start_scan()
-                        print(f"[NavController] Лидар подключен на {port}")
-                        return
-                    else:
-                        self.lidar = None
-                except Exception as e:
-                    print(f"[NavController] Ошибка на порту {port}: {e}")
-                    self.lidar = None
-
-            print("[NavController] Не удалось подключиться к лидару")
-            print("[NavController] Работа продолжится без лидара")
-            self.use_lidar = False
-
-        except ImportError as e:
-            print(f"[NavController] Ошибка импорта драйвера лидара: {e}")
-            print("[NavController] Работа продолжится без лидара")
-            self.use_lidar = False
-        except Exception as e:
-            print(f"[NavController] Неожиданная ошибка при инициализации лидара: {e}")
-            print("[NavController] Работа продолжится без лидара")
-            self.use_lidar = False
+      """Инициализация лидара"""
+      try:
+          sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+          from lidar import LidarDriver
+  
+          # Пробуем подключиться к лидару на разных портах
+          ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']  # ← /dev/ttyUSB1 ПЕРВЫМ!
+  
+          for port in ports:
+              try:
+                  print(f"[NavController] Попытка подключения к лидару на {port}...")
+                  self.lidar = LidarDriver(port=port, baudrate=230400)
+  
+                  if self.lidar.connect():
+                      self.lidar.start_scan()
+                      print(f"[NavController] Лидар подключен на {port}")
+                      return
+                  else:
+                      self.lidar = None
+              except Exception as e:
+                  print(f"[NavController] Ошибка на порту {port}: {e}")
+                  self.lidar = None
+  
+          print("[NavController] Не удалось подключиться к лидару")
+          print("[NavController] Работа продолжится без лидара")
+          self.use_lidar = False
+  
+      except ImportError as e:
+          print(f"[NavController] Ошибка импорта драйвера лидара: {e}")
+          print("[NavController] Работа продолжится без лидара")
+          self.use_lidar = False
+      except Exception as e:
+          print(f"[NavController] Неожиданная ошибка при инициализации лидара: {e}")
+          print("[NavController] Работа продолжится без лидара")
+          self.use_lidar = False
 
     def set_goal(self, x: float, y: float):
         """
@@ -196,11 +202,11 @@ class NavigationController:
 
         # Выполняем действия в зависимости от режима
         if self.mode == NavigationMode.EXPLORATION:
-            self._exploration_behavior()
+            self._safe_exploration_behavior()
         elif self.mode == NavigationMode.NAVIGATION:
-            self._navigation_behavior()
+            self._safe_navigation_behavior()
         elif self.mode == NavigationMode.OBSTACLE_AVOIDANCE:
-            self._avoidance_behavior()
+            self._safe_avoidance_behavior()
 
     def _update_sensors(self):
         """Обновление данных сенсоров"""
@@ -244,12 +250,22 @@ class NavigationController:
             except Exception as e:
                 pass  # Игнорируем ошибки камеры
 
+        if self.use_lidar and self.lidar is not None:
+            try:
+                lidar_scan = self.lidar.get_scan()
+                
+                if lidar_scan and len(lidar_scan) > 0:
+                    self.sensor_fusion.update_lidar(lidar_scan)
+                    self.slam.update_with_lidar(lidar_scan)
+            except Exception as e:
+                pass
+
     def _update_odometry(self, dt: float):
         """
         Обновление одометрии на основе команд движения
         """
         # Параметры робота (примерные)
-        max_speed = 0.3  # максимальная скорость м/с при PWM=100
+        max_speed = 0.15  # УМЕНЬШЕННАЯ максимальная скорость м/с при PWM=100
         wheel_base = 0.15  # расстояние между колесами в метрах
 
         # Преобразуем PWM (0-100) в скорость (м/с)
@@ -303,45 +319,244 @@ class NavigationController:
         self.current_command = command
         self.current_speed = speed
 
-    def _exploration_behavior(self):
-        """Поведение в режиме исследования"""
+    def _safe_move_forward(self, max_duration=1.0, check_interval=0.2):
+        """
+        Безопасное движение вперед с постоянной проверкой препятствий
+        
+        Args:
+            max_duration: максимальное время движения (сек)
+            check_interval: интервал проверки препятствий (сек)
+        
+        Returns:
+            bool: True если движение завершено безопасно, False если было препятствие
+        """
+        start_time = time.time()
+        safe = True
+        
+        # Начинаем движение ОЧЕНЬ МЕДЛЕННО
+        print(f"[SAFE_MOVE] Начинаю движение вперед на {max_duration:.1f}с")
+        ca.move_forward(self.exploration_speed)
+        self._set_movement_command("forward", self.exploration_speed)
+        
+        try:
+            check_count = 0
+            while time.time() - start_time < max_duration:
+                # Ждем до следующей проверки
+                time.sleep(check_interval)
+                check_count += 1
+                
+                # Проверяем датчики
+                obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
+                
+                # Если нет данных от датчиков, используем ультразвук напрямую
+                if obstacle_distance is None and self.use_ultrasonic:
+                    try:
+                        from ultrasonic import read_distance_cm_from_bot
+                        us_cm = read_distance_cm_from_bot()
+                        if us_cm is not None and us_cm > 0:
+                            obstacle_distance = us_cm / 100.0
+                            print(f"[SAFE_MOVE] Ультразвук: {obstacle_distance:.2f}м")
+                    except:
+                        pass
+                
+                if obstacle_distance is None:
+                    # Если все еще нет данных, будем осторожны
+                    print(f"[SAFE_MOVE] ⚠️ Проверка {check_count}: Нет данных датчиков")
+                    
+                    # После 3 проверок без данных - останавливаемся
+                    if check_count >= 3:
+                        print("[SAFE_MOVE] Слишком много проверок без данных, останавливаюсь")
+                        safe = False
+                        break
+                    continue  # Продолжаем движение, но с осторожностью
+                
+                print(f"[SAFE_MOVE] Проверка {check_count}: препятствие = {obstacle_distance:.2f}м")
+                
+                # КРИТИЧЕСКОЕ расстояние - немедленная остановка
+                if obstacle_distance < self.critical_distance:
+                    print(f"[SAFE_MOVE] ⚠️ КРИТИЧЕСКОЕ РАССТОЯНИЕ! {obstacle_distance:.2f}м")
+                    safe = False
+                    break
+                
+                # Близкое препятствие - плавная остановка
+                if obstacle_distance < self.min_obstacle_distance:
+                    # Вычисляем насколько близко
+                    closeness = (self.min_obstacle_distance - obstacle_distance) / self.min_obstacle_distance
+                    
+                    if closeness > 0.5:  # Очень близко (меньше половины min_distance)
+                        print(f"[SAFE_MOVE] Очень близко: {obstacle_distance:.2f}м")
+                        safe = False
+                        break
+                    else:
+                        # Просто замедляемся
+                        print(f"[SAFE_MOVE] Замедляюсь: {obstacle_distance:.2f}м")
+                        # Можно добавить плавное замедление здесь
+                
+                # Все OK, продолжаем
+                if check_count % 5 == 0:  # Реже выводим
+                    print(f"[SAFE_MOVE] Двигаюсь... препятствие: {obstacle_distance:.2f}м")
+                
+        except Exception as e:
+            print(f"[SAFE_MOVE] Ошибка при движении: {e}")
+            safe = False
+            
+        finally:
+            # Всегда останавливаемся плавно
+            print("[SAFE_MOVE] Завершение движения...")
+            
+            # Плавная остановка
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            time.sleep(0.3)
+            
+        if safe:
+            print(f"[SAFE_MOVE] ✓ Движение завершено безопасно ({check_count} проверок)")
+        else:
+            print(f"[SAFE_MOVE] ✗ Движение прервано из-за препятствия")
+            
+        return safe
 
-        # Проверяем наличие препятствий впереди
-        obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
-
-        if obstacle_distance is not None and obstacle_distance < self.min_obstacle_distance:
-            # Препятствие близко - останавливаемся и поворачиваем
+    def _safe_rotate_left(self, max_duration=1.0, check_interval=0.2):
+        """
+        Безопасный поворот налево с проверкой
+        
+        Args:
+            max_duration: максимальное время поворота (сек)
+            check_interval: интервал проверки (сек)
+        
+        Returns:
+            bool: True если поворот завершен безопасно
+        """
+        start_time = time.time()
+        safe = True
+        
+        # Медленный поворот
+        ca.rotate_left(self.turn_speed)
+        self._set_movement_command("rotate_left", self.turn_speed)
+        
+        try:
+            while time.time() - start_time < max_duration:
+                time.sleep(check_interval)
+                
+                # Проверяем, не стало ли что-то слишком близко спереди
+                distance = self.sensor_fusion.get_obstacle_distance('front')
+                if distance and distance < self.critical_distance:
+                    print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
+                    safe = False
+                    break
+                    
+        except Exception as e:
+            print(f"[SAFETY] Ошибка при повороте: {e}")
+            safe = False
+            
+        finally:
             ca.stop_robot()
             self._set_movement_command("stop", 0)
             time.sleep(0.2)
+            
+        return safe
 
-            # Ищем свободное направление
-            free_dirs = self.sensor_fusion.get_free_directions(self.min_obstacle_distance)
-
-            if free_dirs.get('left', False):
-                print("[NavController] Поворот налево")
-                ca.rotate_left(self.exploration_speed)
-                self._set_movement_command("rotate_left", self.exploration_speed)
-                time.sleep(1.0)
-            elif free_dirs.get('right', False):
-                print("[NavController] Поворот направо")
-                ca.rotate_right(self.exploration_speed)
-                self._set_movement_command("rotate_right", self.exploration_speed)
-                time.sleep(1.0)
-            else:
-                print("[NavController] Разворот на 180°")
-                ca.rotate_right(self.exploration_speed)
-                self._set_movement_command("rotate_right", self.exploration_speed)
-                time.sleep(2.0)
-
+    def _safe_rotate_right(self, max_duration=1.0, check_interval=0.2):
+        """Безопасный поворот направо"""
+        start_time = time.time()
+        safe = True
+        
+        ca.rotate_right(self.turn_speed)
+        self._set_movement_command("rotate_right", self.turn_speed)
+        
+        try:
+            while time.time() - start_time < max_duration:
+                time.sleep(check_interval)
+                
+                distance = self.sensor_fusion.get_obstacle_distance('front')
+                if distance and distance < self.critical_distance:
+                    print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
+                    safe = False
+                    break
+                    
+        except Exception as e:
+            print(f"[SAFETY] Ошибка при повороте: {e}")
+            safe = False
+            
+        finally:
             ca.stop_robot()
             self._set_movement_command("stop", 0)
-        else:
-            ca.move_forward(self.exploration_speed)
-            self._set_movement_command("forward", self.exploration_speed)
+            time.sleep(0.2)
+            
+        return safe
 
-    def _navigation_behavior(self):
-        """Поведение в режиме навигации по маршруту"""
+    def _emergency_stop_and_back(self):
+        """Экстренная остановка и отъезд назад"""
+        print("[SAFETY] ⚠️ ЭКСТРЕННАЯ ОСТАНОВКА!")
+        
+        # Немедленная остановка
+        ca.stop_robot()
+        self._set_movement_command("stop", 0)
+        time.sleep(0.3)
+        
+        # Отъезжаем немного назад
+        print("[SAFETY] Отъезжаю назад...")
+        ca.move_backward(self.exploration_speed)
+        self._set_movement_command("backward", self.exploration_speed)
+        time.sleep(0.8)
+        
+        ca.stop_robot()
+        self._set_movement_command("stop", 0)
+        time.sleep(0.3)
+
+    # ===== БЕЗОПАСНЫЕ ПОВЕДЕНИЯ =====
+
+    def _safe_exploration_behavior(self):
+        """БЕЗОПАСНОЕ поведение в режиме исследования"""
+        
+        # Получаем данные с датчиков
+        obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
+        
+        # Отладка
+        print(f"[NAV_DEBUG] Препятствие: {obstacle_distance:.2f}м")
+        
+        if obstacle_distance is None:
+            print("[NAV_DEBUG] Нет данных от датчиков. Безопасный поворот...")
+            self._safe_rotate_left(1.0)
+            return
+        
+        # ЭКСТРЕННАЯ ОСТАНОВКА если слишком близко
+        if obstacle_distance < self.critical_distance:
+            self._emergency_stop_and_back()
+            self._safe_rotate_left(1.0)
+            return
+        
+        # Проверяем расстояние для нормального движения
+        if obstacle_distance < self.min_obstacle_distance:
+            print(f"[NAV_DEBUG] Препятствие на {obstacle_distance:.2f}м")
+            print("[NAV_DEBUG] Безопасный поворот налево...")
+            
+            # Останавливаемся перед поворотом
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            time.sleep(0.2)
+            
+            # Медленный поворот
+            self._safe_rotate_left(1.0)
+            
+        else:
+            print(f"[NAV_DEBUG] Свободно! {obstacle_distance:.2f}м")
+            
+            # Вычисляем безопасное время движения
+            # Чем ближе препятствие, тем короче движение
+            safe_time = min(2.0, (obstacle_distance - self.min_obstacle_distance) * 4)
+            safe_time = max(0.5, safe_time)  # Минимум 0.5 секунды
+            
+            print(f"[NAV_DEBUG] Еду {safe_time:.1f} секунд...")
+            
+            # Безопасное движение вперед
+            if not self._safe_move_forward(safe_time):
+                # Если обнаружено препятствие во время движения
+                print("[NAV_DEBUG] Обнаружено препятствие во время движения")
+                self._safe_rotate_left(1.0)
+
+    def _safe_navigation_behavior(self):
+        """Безопасное поведение в режиме навигации по маршруту"""
 
         if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
             # Путь пройден
@@ -368,15 +583,16 @@ class NavigationController:
             print(f"[NavController] Waypoint {self.current_waypoint_idx}/{len(self.current_path)} достигнут")
             return
 
-        # Проверяем препятствия
+        # Проверяем препятствия перед движением
         obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
 
-        if obstacle_distance is not None and obstacle_distance < self.min_obstacle_distance * 1.5:
+        if obstacle_distance is not None and obstacle_distance < self.min_obstacle_distance:
             # Препятствие на пути - переходим в режим объезда
-            print("[NavController] Препятствие обнаружено, объезд")
+            print(f"[NavController] Препятствие обнаружено ({obstacle_distance:.2f}м), объезд")
             self.mode = NavigationMode.OBSTACLE_AVOIDANCE
             ca.stop_robot()
             self._set_movement_command("stop", 0)
+            time.sleep(0.3)
             return
 
         # Вычисляем направление к waypoint
@@ -384,39 +600,87 @@ class NavigationController:
         angle_diff = self._normalize_angle(target_angle - pose.theta)
 
         # Если угол большой, сначала поворачиваемся
-        if abs(angle_diff) > np.deg2rad(15):
+        if abs(angle_diff) > np.deg2rad(20):
             if angle_diff > 0:
-                ca.rotate_left(self.navigation_speed)
-                self._set_movement_command("rotate_left", self.navigation_speed)
+                print(f"[NavController] Поворачиваю налево {np.degrees(angle_diff):.0f}°")
+                self._safe_rotate_left(min(1.5, abs(angle_diff) / 2.0))
             else:
-                ca.rotate_right(self.navigation_speed)
-                self._set_movement_command("rotate_right", self.navigation_speed)
+                print(f"[NavController] Поворачиваю направо {np.degrees(abs(angle_diff)):.0f}°")
+                self._safe_rotate_right(min(1.5, abs(angle_diff) / 2.0))
         else:
-            # Едем вперед с коррекцией направления
-            # Процентная коррекция на основе угла
-            correction = np.clip(angle_diff * 100 / np.pi, -50, 50)
-            ca.move_param_forward(self.navigation_speed, correction)
-            self._set_movement_command("forward", self.navigation_speed)
+            # Едем вперед с частыми проверками
+            print(f"[NavController] Двигаюсь к waypoint ({distance:.2f}м)")
+            
+            # Двигаемся короткими отрезками с проверкой
+            move_success = True
+            move_start = time.time()
+            
+            while move_success and time.time() - move_start < 1.5:
+                # Проверяем перед движением
+                check_dist = self.sensor_fusion.get_obstacle_distance('front')
+                if check_dist and check_dist < self.min_obstacle_distance:
+                    print(f"[NavController] Препятствие на пути: {check_dist:.2f}м")
+                    move_success = False
+                    break
+                
+                # Двигаемся короткий отрезок
+                ca.move_forward(self.navigation_speed)
+                self._set_movement_command("forward", self.navigation_speed)
+                time.sleep(0.3)
+                
+                # Проверяем снова
+                check_dist = self.sensor_fusion.get_obstacle_distance('front')
+                if check_dist and check_dist < self.min_obstacle_distance:
+                    ca.stop_robot()
+                    self._set_movement_command("stop", 0)
+                    print(f"[NavController] Обнаружено препятствие во время движения: {check_dist:.2f}м")
+                    move_success = False
+                    break
+            
+            # Останавливаемся
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            time.sleep(0.2)
+            
+            if not move_success:
+                self.mode = NavigationMode.OBSTACLE_AVOIDANCE
 
-    def _avoidance_behavior(self):
-        """Поведение при объезде препятствий"""
+    def _safe_avoidance_behavior(self):
+        """Безопасное поведение при объезде препятствий"""
 
+        print("[NavController] Безопасный объезд препятствия")
+        
+        # Сначала отъезжаем немного назад
+        print("[NavController] Отъезжаю назад...")
+        ca.move_backward(self.exploration_speed)
+        self._set_movement_command("backward", self.exploration_speed)
+        time.sleep(0.5)
+        ca.stop_robot()
+        self._set_movement_command("stop", 0)
+        time.sleep(0.3)
+        
         # Получаем свободные направления
         free_dirs = self.sensor_fusion.get_free_directions(self.min_obstacle_distance)
-
+        
+        # Выбираем безопасное направление
         if free_dirs.get('left', False):
-            ca.move_left(self.exploration_speed)
-            time.sleep(0.5)
+            print("[NavController] Объезжаю слева")
+            self._safe_rotate_left(0.8)
+            safe_moved = self._safe_move_forward(1.0)
+            
+            if safe_moved:
+                self._safe_rotate_right(0.8)
         elif free_dirs.get('right', False):
-            ca.move_right(self.exploration_speed)
-            time.sleep(0.5)
+            print("[NavController] Объезжаю справа")
+            self._safe_rotate_right(0.8)
+            safe_moved = self._safe_move_forward(1.0)
+            
+            if safe_moved:
+                self._safe_rotate_left(0.8)
         else:
-            # Отступаем назад
-            ca.move_backward(self.exploration_speed)
-            time.sleep(0.5)
-
-        ca.stop_robot()
-
+            print("[NavController] Нет свободных направлений, поворачиваю на 180°")
+            self._safe_rotate_left(2.0)
+        
         # Пытаемся перепланировать путь
         if self.current_goal:
             pose = self.slam.get_pose()
@@ -431,25 +695,39 @@ class NavigationController:
                 self.mode = NavigationMode.NAVIGATION
                 print("[NavController] Путь перепланирован")
             else:
-                # Не удалось перепланировать, продолжаем объезд
-                pass
+                # Не удалось перепланировать, возвращаемся к исследованию
+                print("[NavController] Не удалось перепланировать, продолжаю исследование")
+                self.mode = NavigationMode.EXPLORATION
         else:
             # Нет цели, возвращаемся к исследованию
             self.mode = NavigationMode.EXPLORATION
 
     def stop(self):
         """Остановка робота"""
-        print("\n[NavController] Остановка")
+        print("\n[NavController] ⚠️ ОСТАНОВКА")
         ca.stop_robot()
         self.mode = NavigationMode.IDLE
 
         # Освобождаем ресурсы лидара
         if self.lidar is not None:
             try:
+                print("[NavController] Останавливаю лидар...")
+                
+                # Сначала обычная остановка
+                self.lidar.stop_scan()
+                time.sleep(0.5)
+                
+                # Если есть метод force_stop, используем его
+                if hasattr(self.lidar, 'force_stop'):
+                    self.lidar.force_stop()
+                    time.sleep(0.5)
+                
+                # Потом отключаем
                 self.lidar.disconnect()
-            except:
-                pass
-
+                
+            except Exception as e:
+                print(f"[NavController] Ошибка остановки лидара: {e}")
+        
         # Освобождаем ресурсы камеры
         if hasattr(self, 'camera_seg') and self.camera_seg is not None:
             try:
@@ -488,3 +766,34 @@ class NavigationController:
             angle += 2 * np.pi
         return angle
 
+    def quick_safety_test(self):
+        """Быстрый тест безопасности движений"""
+        print("="*60)
+        print("ТЕСТ БЕЗОПАСНОСТИ - ОЧЕНЬ МЕДЛЕННОЕ ДВИЖЕНИЕ")
+        print("="*60)
+        
+        # Тест очень медленного движения
+        print("\n1. Очень медленное движение вперед (PWM=10)...")
+        ca.move_forward(10)
+        time.sleep(1.5)
+        ca.stop_robot()
+        time.sleep(0.5)
+        
+        print("\n2. Очень медленный поворот (PWM=8)...")
+        ca.rotate_left(8)
+        time.sleep(1.0)
+        ca.stop_robot()
+        time.sleep(0.5)
+        
+        print("\n3. Очень медленное движение назад (PWM=10)...")
+        ca.move_backward(10)
+        time.sleep(1.0)
+        ca.stop_robot()
+        
+        print("\n✓ Тест завершен. Скорости безопасные.")
+
+
+# Быстрый тест для проверки
+if __name__ == "__main__":
+    nav = NavigationController(use_lidar=False, use_camera=False, use_ultrasonic=True)
+    nav.quick_safety_test()

@@ -318,19 +318,65 @@ class SLAM:
         return True
 
     def save_map(self, filename: str):
-        """Сохранение карты в файл"""
-        import pickle
-        data = {
-            'grid': self.map.grid,
-            'resolution': self.map.resolution,
-            'origin_x': self.map.origin_x,
-            'origin_y': self.map.origin_y,
-            'position_history': list(self.position_history),
-            'landmarks': self.landmarks
-        }
-        with open(filename, 'wb') as f:
-            pickle.dump(data, f)
-        print(f"[SLAM] Карта сохранена: {filename}")
+      """Сохранение карты в файл - ТОЛЬКО PNG"""
+      import matplotlib.pyplot as plt
+      import numpy as np
+      import os
+      
+      # Убедимся что расширение .png
+      if not filename.endswith('.png'):
+          filename = filename + '.png'
+      
+      # Фиксированное имя файла (перезаписывается каждый раз)
+      fixed_filename = "slam_map.png"
+      
+      print(f"[SLAM] Сохранение карты как PNG: {fixed_filename}")
+      
+      # Создаем визуализацию карты
+      plt.figure(figsize=(12, 10))
+      
+      # Преобразуем карту для отображения
+      # 0-50 = свободно, 51-100 = занято, 50 = неизвестно
+      display_map = self.map.grid.copy()
+      
+      # Нормализуем для изображения (0-1)
+      # Инвертируем: занято = темное, свободно = светлое
+      normalized_map = (100.0 - display_map) / 100.0
+      
+      # Определяем границы отображения
+      height, width = display_map.shape
+      extent = [0, width, 0, height]
+      
+      plt.imshow(normalized_map, cmap='gray', origin='lower', 
+                vmin=0, vmax=1, extent=extent)
+      
+      # Добавляем позицию робота
+      px, py = self.map.world_to_grid(self.current_position.x, self.current_position.y)
+      plt.plot(px, py, 'ro', markersize=15, label='Робот', markerfacecolor='red', markeredgecolor='black')
+      
+      # Добавляем историю пути
+      if len(self.position_history) > 1:
+          path_x = []
+          path_y = []
+          for pos in self.position_history:
+              px, py = self.map.world_to_grid(pos.x, pos.y)
+              path_x.append(px)
+              path_y.append(py)
+          plt.plot(path_x, path_y, 'b-', alpha=0.7, linewidth=2, label='Путь')
+      
+      plt.title(f"SLAM карта\nРазрешение: {self.map.resolution}м/пиксель")
+      plt.xlabel("Пиксели (X)")
+      plt.ylabel("Пиксели (Y)")
+      plt.legend(loc='upper right')
+      plt.colorbar(label="0=занято, 1=свободно")
+      plt.grid(True, alpha=0.3, linestyle='--')
+      
+      # Сохраняем с высоким качеством
+      plt.savefig(fixed_filename, dpi=150, bbox_inches='tight', facecolor='white')
+      plt.close()
+      
+      print(f"[SLAM] ✅ Карта сохранена: {fixed_filename}")
+      print(f"[SLAM] Размер: {width}x{height}, Позиция робота: ({px}, {py})")
 
     def load_map(self, filename: str):
         """Загрузка карты из файла"""
