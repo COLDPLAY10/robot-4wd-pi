@@ -9,7 +9,10 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-
+import pickle
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import os
 
 
 @dataclass
@@ -62,18 +65,21 @@ class OccupancyGrid:
         return x, y
 
     def update_cell(self, x: float, y: float, occupied: bool, confidence: float = 0.7):
-        """Обновление вероятности занятости ячейки"""
+        """Обновление вероятности занятости ячейки (логарифмический метод)"""
         gx, gy = self.world_to_grid(x, y)
 
         if not (0 <= gx < self.width and 0 <= gy < self.height):
             return
 
+        current_value = self.grid[gy, gx]
+
         if occupied:
-            # Увеличиваем вероятность занятости
-            self.grid[gy, gx] = min(100, self.grid[gy, gx] + confidence * 30)
+
+            delta = confidence * 15
+            self.grid[gy, gx] = min(95, current_value + delta)
         else:
-            # Уменьшаем вероятность занятости (свободная область)
-            self.grid[gy, gx] = max(0, self.grid[gy, gx] - confidence * 10)
+            delta = confidence * 8
+            self.grid[gy, gx] = max(5, current_value - delta)
 
     def is_occupied(self, x: float, y: float, threshold: float = 60) -> bool:
         """Проверка занятости точки"""
@@ -318,65 +324,134 @@ class SLAM:
         return True
 
     def save_map(self, filename: str):
-      """Сохранение карты в файл - ТОЛЬКО PNG"""
-      import matplotlib.pyplot as plt
-      import numpy as np
-      import os
-      
-      # Убедимся что расширение .png
-      if not filename.endswith('.png'):
-          filename = filename + '.png'
-      
-      # Фиксированное имя файла (перезаписывается каждый раз)
-      fixed_filename = "slam_map.png"
-      
-      print(f"[SLAM] Сохранение карты как PNG: {fixed_filename}")
-      
-      # Создаем визуализацию карты
-      plt.figure(figsize=(12, 10))
-      
-      # Преобразуем карту для отображения
-      # 0-50 = свободно, 51-100 = занято, 50 = неизвестно
-      display_map = self.map.grid.copy()
-      
-      # Нормализуем для изображения (0-1)
-      # Инвертируем: занято = темное, свободно = светлое
-      normalized_map = (100.0 - display_map) / 100.0
-      
-      # Определяем границы отображения
-      height, width = display_map.shape
-      extent = [0, width, 0, height]
-      
-      plt.imshow(normalized_map, cmap='gray', origin='lower', 
-                vmin=0, vmax=1, extent=extent)
-      
-      # Добавляем позицию робота
-      px, py = self.map.world_to_grid(self.current_position.x, self.current_position.y)
-      plt.plot(px, py, 'ro', markersize=15, label='Робот', markerfacecolor='red', markeredgecolor='black')
-      
-      # Добавляем историю пути
-      if len(self.position_history) > 1:
-          path_x = []
-          path_y = []
-          for pos in self.position_history:
-              px, py = self.map.world_to_grid(pos.x, pos.y)
-              path_x.append(px)
-              path_y.append(py)
-          plt.plot(path_x, path_y, 'b-', alpha=0.7, linewidth=2, label='Путь')
-      
-      plt.title(f"SLAM карта\nРазрешение: {self.map.resolution}м/пиксель")
-      plt.xlabel("Пиксели (X)")
-      plt.ylabel("Пиксели (Y)")
-      plt.legend(loc='upper right')
-      plt.colorbar(label="0=занято, 1=свободно")
-      plt.grid(True, alpha=0.3, linestyle='--')
-      
-      # Сохраняем с высоким качеством
-      plt.savefig(fixed_filename, dpi=150, bbox_inches='tight', facecolor='white')
-      plt.close()
-      
-      print(f"[SLAM] ✅ Карта сохранена: {fixed_filename}")
-      print(f"[SLAM] Размер: {width}x{height}, Позиция робота: ({px}, {py})")
+        """Сохранение карты в файл (PKL + PNG визуализация)"""
+
+        base_filename = os.path.splitext(filename)[0]
+        pkl_filename = base_filename + '.pkl'
+        png_filename = 'slam_map.png'
+
+        data = {
+            'grid': self.map.grid,
+            'resolution': self.map.resolution,
+            'origin_x': self.map.origin_x,
+            'origin_y': self.map.origin_y,
+            'position_history': list(self.position_history),
+            'landmarks': self.landmarks,
+            'use_lidar': self.use_lidar
+        }
+
+        with open(pkl_filename, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"[SLAM] Данные карты сохранены: {pkl_filename}")
+
+        # 2. Создаем PNG визуализацию
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+
+        # === ЛЕВАЯ ПАНЕЛЬ: Основная карта ===
+        display_map = self.map.grid.copy()
+        height, width = display_map.shape
+
+        colors = ['darkgreen', 'green', 'lightgreen', 'gray', 'orange', 'red', 'darkred']
+        n_bins = 100
+        cmap = mcolors.LinearSegmentedColormap.from_list('occupancy', colors, N=n_bins)
+
+        extent = [0, width, 0, height]
+        im1 = ax1.imshow(display_map, cmap=cmap, origin='lower',
+                        vmin=0, vmax=100, extent=extent, interpolation='nearest')
+
+        # Добавляем позицию робота
+        px, py = self.map.world_to_grid(self.current_position.x, self.current_position.y)
+        ax1.plot(px, py, 'o', markersize=20, label='Робот',
+                markerfacecolor='blue', markeredgecolor='white', markeredgewidth=3, zorder=10)
+
+        # Стрелка направления робота
+        arrow_len = 15
+        dx = arrow_len * np.cos(self.current_position.theta)
+        dy = arrow_len * np.sin(self.current_position.theta)
+        ax1.arrow(px, py, dx, dy, head_width=8, head_length=5,
+                 fc='blue', ec='white', linewidth=2, zorder=11)
+
+        # Добавляем историю пути
+        path_x = []
+        path_y = []
+        if len(self.position_history) > 1:
+            for pos in self.position_history:
+                gx, gy = self.map.world_to_grid(pos.x, pos.y)
+                path_x.append(gx)
+                path_y.append(gy)
+            ax1.plot(path_x, path_y, 'cyan', alpha=0.8, linewidth=3,
+                    label=f'Путь ({len(path_x)} точек)', zorder=9)
+
+        ax1.set_title(f"SLAM карта\nРазрешение: {self.map.resolution}м/ячейка", fontsize=14, fontweight='bold')
+        ax1.set_xlabel("Ячейки сетки (X)", fontsize=12)
+        ax1.set_ylabel("Ячейки сетки (Y)", fontsize=12)
+        ax1.legend(loc='upper right', fontsize=10)
+        ax1.grid(True, alpha=0.2, linestyle='--', color='white')
+
+        cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cbar1.set_label('Вероятность занятости\n(0=свободно, 100=занято)', fontsize=10)
+
+        # === ПРАВАЯ ПАНЕЛЬ: Бинарная картат ===
+        binary_map = np.zeros_like(display_map)
+        binary_map[display_map < 30] = 0    # Свободно (белое)
+        binary_map[display_map >= 70] = 2   # Занято (черное)
+        binary_map[(display_map >= 30) & (display_map < 70)] = 1  # Неизвестно (серое)
+
+        cmap_binary = mcolors.ListedColormap(['white', 'gray', 'black'])
+        bounds = [0, 0.5, 1.5, 2.5]
+        norm = mcolors.BoundaryNorm(bounds, cmap_binary.N)
+
+        im2 = ax2.imshow(binary_map, cmap=cmap_binary, norm=norm,
+                        origin='lower', extent=extent, interpolation='nearest')
+
+        # Робот на бинарной карте
+        ax2.plot(px, py, 'o', markersize=20,
+                markerfacecolor='red', markeredgecolor='white', markeredgewidth=3, zorder=10)
+        ax2.arrow(px, py, dx, dy, head_width=8, head_length=5,
+                 fc='red', ec='white', linewidth=2, zorder=11)
+
+        # Путь на бинарной карте
+        if len(self.position_history) > 1:
+            ax2.plot(path_x, path_y, 'b-', alpha=0.7, linewidth=2, zorder=9)
+
+        ax2.set_title("Бинарная карта (упрощенная)", fontsize=14, fontweight='bold')
+        ax2.set_xlabel("Ячейки сетки (X)", fontsize=12)
+        ax2.set_ylabel("Ячейки сетки (Y)", fontsize=12)
+        ax2.grid(True, alpha=0.3, linestyle='--')
+
+        # Colorbar для бинарной карты
+        cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04,
+                            ticks=[0.25, 1, 1.75])
+        cbar2.ax.set_yticklabels(['Свободно', 'Неизвестно', 'Занято'])
+
+        total_cells = width * height
+        free_cells = np.sum(display_map < 30)
+        occupied_cells = np.sum(display_map >= 70)
+        unknown_cells = total_cells - free_cells - occupied_cells
+        explored_pct = ((free_cells + occupied_cells) / total_cells) * 100
+
+        stats_text = (
+            f"Статистика карты:\n"
+            f"Размер: {width}×{height} ({total_cells} ячеек)\n"
+            f"Исследовано: {explored_pct:.1f}%\n"
+            f"Свободно: {free_cells} ({free_cells/total_cells*100:.1f}%)\n"
+            f"Занято: {occupied_cells} ({occupied_cells/total_cells*100:.1f}%)\n"
+            f"Неизвестно: {unknown_cells} ({unknown_cells/total_cells*100:.1f}%)\n"
+            f"Пройдено: {len(self.position_history)} позиций\n"
+            f"Робот: ({self.current_position.x:.2f}, {self.current_position.y:.2f}, {np.rad2deg(self.current_position.theta):.0f}°)"
+        )
+
+        fig.text(0.5, 0.02, stats_text, ha='center', fontsize=10,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                family='monospace')
+
+        plt.tight_layout(rect=[0, 0.12, 1, 1])
+        plt.savefig(png_filename, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+
+        print(f"[SLAM] Визуализация сохранена: {png_filename}")
+        print(f"[SLAM] Карта: {width}×{height}, Исследовано: {explored_pct:.1f}%")
+        print(f"[SLAM] Робот: ({px}, {py}), Путь: {len(self.position_history)} точек")
 
     def load_map(self, filename: str):
         """Загрузка карты из файла"""
