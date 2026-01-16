@@ -111,11 +111,6 @@ class LidarDriver:
     def _parse_packet_fixed(self, packet):
         """
         Парсинг пакета T-MINI Plus
-        Формат: AA 55 [CT] [LSN] [FSA_L] [FSA_H] [LSA_L] [LSA_H] [CS]
-
-        После тестирования установлено:
-        - Байты 4-5: расстояние в мм (little-endian)
-        - Байты 6-7: угол (требует калибровки)
         """
         if len(packet) != 9:
             return
