@@ -88,6 +88,10 @@ class NavigationController:
         self.current_command = "stop"  # stop, forward, backward, left, right, rotate_left, rotate_right
         self.current_speed = 0  # PWM 0-100
 
+        # Счетчик последовательных поворотов (для предотвращения зацикливания)
+        self.consecutive_rotations = 0
+        self.max_consecutive_rotations = 3  # Максимум 3 поворота подряд
+
         # Робот
         self.bot = ca.bot
 
@@ -332,14 +336,14 @@ class NavigationController:
         """
         start_time = time.time()
         safe = True
-        
+        check_count = 0
+
         # Начинаем движение ОЧЕНЬ МЕДЛЕННО
         print(f"[SAFE_MOVE] Начинаю движение вперед на {max_duration:.1f}с")
         ca.move_forward(self.exploration_speed)
         self._set_movement_command("forward", self.exploration_speed)
         
         try:
-            check_count = 0
             while time.time() - start_time < max_duration:
                 # Ждем до следующей проверки
                 time.sleep(check_interval)
@@ -513,47 +517,90 @@ class NavigationController:
         obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
         
         # Отладка
-        print(f"[NAV_DEBUG] Препятствие: {obstacle_distance:.2f}м")
-        
+        if obstacle_distance is not None:
+            print(f"[NAV_DEBUG] Препятствие: {obstacle_distance:.2f}м")
+        else:
+            print("[NAV_DEBUG] Нет данных от датчиков")
+
+        # Если нет данных от датчиков
         if obstacle_distance is None:
-            print("[NAV_DEBUG] Нет данных от датчиков. Безопасный поворот...")
-            self._safe_rotate_left(1.0)
+            # Проверяем не зациклились ли мы
+            if self.consecutive_rotations >= self.max_consecutive_rotations:
+                print("[NAV_DEBUG] Много поворотов подряд, пробую короткое движение вперед...")
+                self.consecutive_rotations = 0
+                # Короткое пробное движение
+                if self._safe_move_forward(0.5):
+                    print("[NAV_DEBUG] Движение успешно")
+                else:
+                    print("[NAV_DEBUG] Препятствие обнаружено, поворачиваю")
+                    self._safe_rotate_left(0.8)
+                    self.consecutive_rotations += 1
+            else:
+                print("[NAV_DEBUG] Нет данных - короткий поворот для сканирования...")
+                self._safe_rotate_left(0.7)
+                self.consecutive_rotations += 1
             return
         
         # ЭКСТРЕННАЯ ОСТАНОВКА если слишком близко
         if obstacle_distance < self.critical_distance:
             self._emergency_stop_and_back()
             self._safe_rotate_left(1.0)
+            self.consecutive_rotations += 1
             return
         
         # Проверяем расстояние для нормального движения
         if obstacle_distance < self.min_obstacle_distance:
-            print(f"[NAV_DEBUG] Препятствие на {obstacle_distance:.2f}м")
-            print("[NAV_DEBUG] Безопасный поворот налево...")
-            
-            # Останавливаемся перед поворотом
-            ca.stop_robot()
-            self._set_movement_command("stop", 0)
-            time.sleep(0.2)
-            
-            # Медленный поворот
-            self._safe_rotate_left(1.0)
-            
+            print(f"[NAV_DEBUG] Препятствие близко: {obstacle_distance:.2f}м")
+
+            # Проверяем не зациклились ли мы на поворотах
+            if self.consecutive_rotations >= self.max_consecutive_rotations:
+                print("[NAV_DEBUG] ⚠️ Зацикливание на поворотах! Пробую объезд...")
+                self.consecutive_rotations = 0
+
+                # Отъезжаем назад
+                print("[NAV_DEBUG] Отъезжаю назад...")
+                ca.move_backward(self.exploration_speed)
+                self._set_movement_command("backward", self.exploration_speed)
+                time.sleep(0.7)
+                ca.stop_robot()
+                self._set_movement_command("stop", 0)
+                time.sleep(0.3)
+
+                # Поворачиваем направо для разнообразия
+                print("[NAV_DEBUG] Поворот направо...")
+                self._safe_rotate_right(1.2)
+            else:
+                print("[NAV_DEBUG] Поворачиваю налево для обхода...")
+
+                # Останавливаемся перед поворотом
+                ca.stop_robot()
+                self._set_movement_command("stop", 0)
+                time.sleep(0.2)
+
+                # Медленный поворот
+                self._safe_rotate_left(1.0)
+                self.consecutive_rotations += 1
+
         else:
-            print(f"[NAV_DEBUG] Свободно! {obstacle_distance:.2f}м")
-            
+            print(f"[NAV_DEBUG] ✓ Свободный путь: {obstacle_distance:.2f}м")
+
+            self.consecutive_rotations = 0
+
             # Вычисляем безопасное время движения
-            # Чем ближе препятствие, тем короче движение
-            safe_time = min(2.0, (obstacle_distance - self.min_obstacle_distance) * 4)
-            safe_time = max(0.5, safe_time)  # Минимум 0.5 секунды
-            
-            print(f"[NAV_DEBUG] Еду {safe_time:.1f} секунд...")
-            
+            # Чем дальше препятствие, тем дольше можем ехать
+            safe_time = min(2.5, (obstacle_distance - self.min_obstacle_distance) * 3)
+            safe_time = max(0.6, safe_time)
+
+            print(f"[NAV_DEBUG] Движение вперед на {safe_time:.1f} сек...")
+
             # Безопасное движение вперед
             if not self._safe_move_forward(safe_time):
                 # Если обнаружено препятствие во время движения
-                print("[NAV_DEBUG] Обнаружено препятствие во время движения")
+                print("[NAV_DEBUG] Препятствие обнаружено во время движения")
                 self._safe_rotate_left(1.0)
+                self.consecutive_rotations += 1
+            else:
+                print("[NAV_DEBUG] ✓ Движение завершено успешно")
 
     def _safe_navigation_behavior(self):
         """Безопасное поведение в режиме навигации по маршруту"""
