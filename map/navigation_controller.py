@@ -254,16 +254,6 @@ class NavigationController:
             except Exception as e:
                 pass  # Игнорируем ошибки камеры
 
-        if self.use_lidar and self.lidar is not None:
-            try:
-                lidar_scan = self.lidar.get_scan()
-                
-                if lidar_scan and len(lidar_scan) > 0:
-                    self.sensor_fusion.update_lidar(lidar_scan)
-                    self.slam.update_with_lidar(lidar_scan)
-            except Exception as e:
-                pass
-
     def _update_odometry(self, dt: float):
         """
         Обновление одометрии на основе команд движения

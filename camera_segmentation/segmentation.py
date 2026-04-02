@@ -152,9 +152,9 @@ class CameraSegmentation:
         """
         h = mask_region.shape[0]
 
-        # Ищем первое препятствие снизу вверх
+        # Ищем первое препятствие снизу вверх (не unknown=0 и не floor=10)
         for row in range(h - 1, -1, -1):
-            if np.any(mask_region[row] > CLASS_FLOOR):
+            if np.any((mask_region[row] > 0) & (mask_region[row] != CLASS_FLOOR)):
                 # Чем ниже в кадре, тем ближе
                 distance = MAX_DISTANCE_ESTIMATE * (1.0 - (h - row) / h)
                 return max(MIN_DISTANCE_ESTIMATE, distance)

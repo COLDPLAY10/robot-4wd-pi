@@ -236,26 +236,34 @@ class SensorFusion:
             return None
 
         # Определяем диапазон углов для направления
+        # Углы нормализованы в [-π, π]
         angle_ranges = {
             'front': (-np.pi/6, np.pi/6),      # ±30 градусов
             'right': (-np.pi/2, -np.pi/6),     # -90 до -30
             'left': (np.pi/6, np.pi/2),        # 30 до 90
-            'back': (2*np.pi/3, 4*np.pi/3)     # 120 до 240
+            'back': None                         # обрабатывается отдельно (переход через ±π)
         }
 
         if direction not in angle_ranges:
             return None
 
-        min_angle, max_angle = angle_ranges[direction]
         min_dist = float('inf')
 
         for angle, distance in scan_data:
             # Нормализуем угол
             angle = self._normalize_angle(angle)
 
-            if min_angle <= angle <= max_angle:
-                if 0 < distance < min_dist:
-                    min_dist = distance
+            # Для 'back' обрабатываем переход через ±π отдельно
+            if direction == 'back':
+                # Задняя полусфера: |angle| > 5π/6 (~150°)
+                if abs(angle) > 5 * np.pi / 6:
+                    if 0 < distance < min_dist:
+                        min_dist = distance
+            else:
+                min_angle, max_angle = angle_ranges[direction]
+                if min_angle <= angle <= max_angle:
+                    if 0 < distance < min_dist:
+                        min_dist = distance
 
         return min_dist if min_dist != float('inf') else None
 
@@ -278,7 +286,7 @@ class SensorFusion:
 
         # Ищем первое препятствие (снизу вверх)
         for row in range(roi.shape[0] - 1, -1, -1):
-            if np.any(roi[row] > 0):
+            if np.any((roi[row] > 0) & (roi[row] != 10)):  # не unknown(0) и не floor(10)
                 # Оценка расстояния по вертикальной позиции
                 distance = 3.0 * (1.0 - (roi.shape[0] - row) / roi.shape[0])
                 return max(0.2, distance)

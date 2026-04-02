@@ -65,21 +65,37 @@ class OccupancyGrid:
         return x, y
 
     def update_cell(self, x: float, y: float, occupied: bool, confidence: float = 0.7):
-        """Обновление вероятности занятости ячейки (логарифмический метод)"""
+        """Обновление вероятности занятости ячейки (логарифмический метод log-odds)"""
         gx, gy = self.world_to_grid(x, y)
 
         if not (0 <= gx < self.width and 0 <= gy < self.height):
             return
 
+        # Текущее значение вероятности [0..100] -> p [0.01..0.99]
         current_value = self.grid[gy, gx]
+        p = np.clip(current_value / 100.0, 0.01, 0.99)
 
+        # Текущий log-odds
+        l_prev = np.log(p / (1.0 - p))
+
+        # Log-odds измерения на основе confidence
         if occupied:
-
-            delta = confidence * 15
-            self.grid[gy, gx] = min(95, current_value + delta)
+            p_meas = 0.5 + confidence * 0.45  # confidence=0.9 -> p_meas=0.905
         else:
-            delta = confidence * 8
-            self.grid[gy, gx] = max(5, current_value - delta)
+            p_meas = 0.5 - confidence * 0.45  # confidence=0.5 -> p_meas=0.275
+
+        p_meas = np.clip(p_meas, 0.01, 0.99)
+        l_meas = np.log(p_meas / (1.0 - p_meas))
+
+        # Обновление: вычитаем prior (log-odds 50% = 0), т.к. prior уже учтён в l_prev
+        l_new = l_prev + l_meas
+
+        # Ограничиваем log-odds для предотвращения чрезмерного насыщения
+        l_new = np.clip(l_new, -5.0, 5.0)
+
+        # Обратно в вероятность [0..100]
+        p_new = 1.0 / (1.0 + np.exp(-l_new))
+        self.grid[gy, gx] = p_new * 100.0
 
     def is_occupied(self, x: float, y: float, threshold: float = 60) -> bool:
         """Проверка занятости точки"""
@@ -207,6 +223,7 @@ class SLAM:
     def update_with_ultrasonic(self, distance: float, sensor_angle: float = 0.0):
         """
         Обновление карты данными ультразвукового датчика
+        Ультразвук имеет конус ~30°, моделируем несколькими лучами
 
         Args:
             distance: расстояние в метрах
@@ -219,23 +236,35 @@ class SLAM:
         robot_y = self.current_position.y
         robot_theta = self.current_position.theta
 
-        # Глобальный угол
-        global_angle = robot_theta + sensor_angle
+        # Конус ультразвука ~30° (±15°), разбиваем на несколько лучей
+        cone_half_angle = np.deg2rad(15)
+        num_rays = 7  # лучей в конусе
 
-        # Координаты препятствия
-        obs_x = robot_x + distance * np.cos(global_angle)
-        obs_y = robot_y + distance * np.sin(global_angle)
+        for i in range(num_rays):
+            # Угол луча внутри конуса
+            ray_offset = -cone_half_angle + (2 * cone_half_angle) * i / (num_rays - 1)
+            global_angle = robot_theta + sensor_angle + ray_offset
 
-        # Ультразвук менее точен, поэтому меньшая уверенность
-        self.map.update_cell(obs_x, obs_y, occupied=True, confidence=0.6)
+            # Расстояние по краям конуса может быть чуть больше (геометрия)
+            ray_distance = distance / np.cos(ray_offset) if abs(ray_offset) < np.deg2rad(14) else distance
 
-        # Свободное пространство
-        num_steps = max(2, int(distance / (self.map.resolution * 2)))
-        for i in range(1, num_steps):
-            t = i / num_steps
-            free_x = robot_x + t * distance * np.cos(global_angle)
-            free_y = robot_y + t * distance * np.sin(global_angle)
-            self.map.update_cell(free_x, free_y, occupied=False, confidence=0.4)
+            # Координаты препятствия
+            obs_x = robot_x + ray_distance * np.cos(global_angle)
+            obs_y = robot_y + ray_distance * np.sin(global_angle)
+
+            # Уверенность ниже по краям конуса
+            edge_factor = 1.0 - abs(ray_offset) / cone_half_angle
+            ray_confidence = 0.4 + 0.2 * edge_factor  # от 0.4 на краю до 0.6 в центре
+
+            self.map.update_cell(obs_x, obs_y, occupied=True, confidence=ray_confidence)
+
+            # Свободное пространство по лучу
+            num_steps = max(2, int(ray_distance / (self.map.resolution * 2)))
+            for j in range(1, num_steps):
+                t = j / num_steps
+                free_x = robot_x + t * ray_distance * np.cos(global_angle)
+                free_y = robot_y + t * ray_distance * np.sin(global_angle)
+                self.map.update_cell(free_x, free_y, occupied=False, confidence=0.3 * edge_factor + 0.1)
 
     def update_with_camera_segmentation(self, segmentation_mask: np.ndarray,
                                        camera_fov: float = 60.0,
@@ -245,7 +274,7 @@ class SLAM:
 
         Args:
             segmentation_mask: маска сегментации (H x W), где значения:
-                              0 - пол (свободно), 1 - препятствие, 2 - стена, 3 - сетка
+                              0 - неизвестно, 1 - препятствие, 2 - стена, 3 - сетка, 10 - пол (свободно)
             camera_fov: угол обзора камеры в градусах
             max_distance: максимальная дальность проекции в метрах
         """
@@ -264,18 +293,21 @@ class SLAM:
 
             # Ищем препятствие в колонке (снизу вверх)
             obstacle_found = False
+            floor_found = False
             distance_estimate = max_distance
 
             for row in range(h - 1, h // 2, -1):  # нижняя половина изображения
                 val = segmentation_mask[row, col]
 
-                if val > 0:  # препятствие, стена или сетка
+                if val > 0 and val != 10:  # препятствие, стена или сетка (не пол=10 и не unknown=0)
                     # Оценка расстояния по вертикальной позиции в кадре
                     # Чем ниже в кадре, тем ближе
                     distance_estimate = max_distance * (1.0 - (h - row) / (h / 2))
                     distance_estimate = max(0.3, min(max_distance, distance_estimate))
                     obstacle_found = True
                     break
+                elif val == 10:  # пол
+                    floor_found = True
 
             if obstacle_found:
                 # Координаты препятствия
@@ -283,8 +315,8 @@ class SLAM:
                 obs_y = robot_y + distance_estimate * np.sin(global_angle)
 
                 self.map.update_cell(obs_x, obs_y, occupied=True, confidence=0.7)
-            else:
-                # Свободное пространство
+            elif floor_found:
+                # Свободное пространство — только если реально видим пол
                 for d in np.linspace(0.2, max_distance * 0.8, 5):
                     free_x = robot_x + d * np.cos(global_angle)
                     free_y = robot_y + d * np.sin(global_angle)
@@ -328,7 +360,7 @@ class SLAM:
 
         base_filename = os.path.splitext(filename)[0]
         pkl_filename = base_filename + '.pkl'
-        png_filename = 'slam_map.png'
+        png_filename = base_filename + '.png'
 
         data = {
             'grid': self.map.grid,

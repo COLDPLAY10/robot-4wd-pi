@@ -5,7 +5,7 @@
 import cv2
 import numpy as np
 
-from .config import CLASS_FLOOR, CLASS_OBSTACLE, CLASS_WALL
+from .config import CLASS_FLOOR, CLASS_OBSTACLE, CLASS_WALL, CLASS_UNKNOWN
 
 
 def simple_color_segmentation(frame: np.ndarray) -> np.ndarray:
@@ -19,7 +19,7 @@ def simple_color_segmentation(frame: np.ndarray) -> np.ndarray:
         маска сегментации (H x W)
     """
     h, w = frame.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
+    mask = np.full((h, w), CLASS_UNKNOWN, dtype=np.uint8)
 
     # Конвертируем в grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

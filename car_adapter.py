@@ -5,6 +5,10 @@ import math
 bot = Raspbot()
 debug = 0
 
+def _clamp_pwm(value, min_val=-255, max_val=255):
+    """Ограничение PWM значения в допустимом диапазоне"""
+    return max(min_val, min(max_val, int(value)))
+
 #ехать вперёд вычисляет значения для четырёх моторов
 
 def move_forward(speed):
