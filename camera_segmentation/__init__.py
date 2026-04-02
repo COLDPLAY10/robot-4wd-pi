@@ -11,6 +11,7 @@ __all__ = [
     'CAMERA_ID',
     'FRAME_W',
     'FRAME_H',
+    'CLASS_UNKNOWN',
     'CLASS_FLOOR',
     'CLASS_OBSTACLE',
     'CLASS_WALL',
