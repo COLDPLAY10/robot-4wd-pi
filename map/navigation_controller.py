@@ -68,12 +68,12 @@ class NavigationController:
         # Режим работы
         self.mode = NavigationMode.IDLE
 
-        # Параметры движения (УМЕНЬШЕННЫЕ для безопасности!)
-        self.exploration_speed = 10      # ОЧЕНЬ медленная скорость для анализа (было 15)
-        self.navigation_speed = 15       # Медленная скорость для маршрута (было 30)
-        self.turn_speed = 8              # Скорость поворота
-        self.min_obstacle_distance = 0.4 # Увеличенное минимальное расстояние (было 0.3)
-        self.critical_distance = 0.2     # Критическое расстояние для экстренной остановки
+        # Параметры движения (откалибровано для 4WD)
+        self.exploration_speed = 30      # Скорость для исследования (PWM, мин. для реального движения)
+        self.navigation_speed = 40       # Скорость для навигации по маршруту
+        self.turn_speed = 20             # Скорость поворота
+        self.min_obstacle_distance = 0.4 # Минимальное расстояние до препятствия (м)
+        self.critical_distance = 0.15    # Критическое расстояние для экстренной остановки
         self.goal_tolerance = 0.2        # допустимое отклонение от цели (м)
 
         # Текущая цель
@@ -232,8 +232,11 @@ class NavigationController:
             try:
                 lidar_scan = self.lidar.get_scan()
                 if lidar_scan and len(lidar_scan) > 0:
-                    self.sensor_fusion.update_lidar(lidar_scan)
-                    self.slam.update_with_lidar(lidar_scan)
+                    # Фильтрация шума: отбрасываем точки ближе 12 см (шум T-MINI Plus)
+                    filtered_scan = [(a, d) for a, d in lidar_scan if d >= 0.12]
+                    if filtered_scan:
+                        self.sensor_fusion.update_lidar(filtered_scan)
+                        self.slam.update_with_lidar(filtered_scan)
             except Exception as e:
                 pass  # Игнорируем ошибки чтения лидара
 
@@ -506,11 +509,16 @@ class NavigationController:
         # Получаем данные с датчиков
         obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
         
-        # Отладка
-        if obstacle_distance is not None:
-            print(f"[NAV_DEBUG] Препятствие: {obstacle_distance:.2f}м")
-        else:
-            print("[NAV_DEBUG] Нет данных от датчиков")
+        # Отладка — не чаще раза в секунду (чтобы не засорять лог)
+        now = time.time()
+        if not hasattr(self, '_last_nav_debug_time'):
+            self._last_nav_debug_time = 0
+        if now - self._last_nav_debug_time >= 1.0:
+            if obstacle_distance is not None:
+                print(f"[NAV_DEBUG] Препятствие: {obstacle_distance:.2f}м")
+            else:
+                print("[NAV_DEBUG] Нет данных от датчиков")
+            self._last_nav_debug_time = now
 
         # Если нет данных от датчиков
         if obstacle_distance is None:
@@ -809,21 +817,21 @@ class NavigationController:
         print("ТЕСТ БЕЗОПАСНОСТИ - ОЧЕНЬ МЕДЛЕННОЕ ДВИЖЕНИЕ")
         print("="*60)
         
-        # Тест очень медленного движения
-        print("\n1. Очень медленное движение вперед (PWM=10)...")
-        ca.move_forward(10)
+        # Тест медленного движения
+        print("\n1. Медленное движение вперед (PWM=30)...")
+        ca.move_forward(30)
         time.sleep(1.5)
         ca.stop_robot()
         time.sleep(0.5)
         
-        print("\n2. Очень медленный поворот (PWM=8)...")
-        ca.rotate_left(8)
+        print("\n2. Медленный поворот (PWM=20)...")
+        ca.rotate_left(20)
         time.sleep(1.0)
         ca.stop_robot()
         time.sleep(0.5)
         
-        print("\n3. Очень медленное движение назад (PWM=10)...")
-        ca.move_backward(10)
+        print("\n3. Медленное движение назад (PWM=30)...")
+        ca.move_backward(30)
         time.sleep(1.0)
         ca.stop_robot()
         
