@@ -154,19 +154,34 @@ class SensorFusion:
                 if dist is not None:
                     distances.append((dist, self.sensor_priority['camera']))
 
-        # Выбираем расстояние с наивысшим приоритетом
+        # Выбираем итоговое расстояние с учётом кросс-валидации датчиков
         if not distances:
             return None
 
         # Сортируем по приоритету (убывание)
         distances.sort(key=lambda x: x[1], reverse=True)
 
-        # Если есть данные от высокоприоритетных сенсоров, используем их
-        # Иначе берем минимальное расстояние (безопаснее)
-        if distances[0][1] >= self.sensor_priority['lidar']:
-            return distances[0][0]
-        else:
-            return min(d[0] for d in distances)
+        # Кросс-валидация: если лидар говорит "очень близко", но ультразвук
+        # показывает "свободно" — лидар шумит, доверяем ультразвуку
+        lidar_dist = None
+        ultrasonic_dist = None
+        for d, p in distances:
+            if p == self.sensor_priority['lidar']:
+                lidar_dist = d
+            if p == self.sensor_priority['ultrasonic']:
+                ultrasonic_dist = d
+
+        if lidar_dist is not None and ultrasonic_dist is not None:
+            # Если лидар говорит < 20 см, а ультразвук > 40 см — явное противоречие
+            if lidar_dist < 0.20 and ultrasonic_dist > 0.40:
+                print(f"[SensorFusion] ⚠️ Конфликт: лидар={lidar_dist:.2f}м, ультразвук={ultrasonic_dist:.2f}м → доверяем ультразвуку")
+                return ultrasonic_dist
+            # Если оба примерно согласны (разница < 2x), берём средневзвешенное
+            # Лидар точнее, но ультразвук надёжнее вблизи
+            return lidar_dist * 0.6 + ultrasonic_dist * 0.4
+
+        # Если только один датчик — используем его
+        return distances[0][0]
 
     def is_obstacle_detected(self, min_distance: float = 0.3) -> bool:
         """
@@ -231,41 +246,60 @@ class SensorFusion:
         return result
 
     def _extract_lidar_distance(self, scan_data, direction: str) -> Optional[float]:
-        """Извлечение расстояния из данных лидара для заданного направления"""
+        """
+        Извлечение расстояния из данных лидара для заданного направления.
+        Использует медианную фильтрацию для устойчивости к шуму.
+        """
         if not scan_data:
             return None
 
         # Определяем диапазон углов для направления
-        # Углы нормализованы в [-π, π]
         angle_ranges = {
             'front': (-np.pi/6, np.pi/6),      # ±30 градусов
             'right': (-np.pi/2, -np.pi/6),     # -90 до -30
             'left': (np.pi/6, np.pi/2),        # 30 до 90
-            'back': None                         # обрабатывается отдельно (переход через ±π)
+            'back': None                         # обрабатывается отдельно
         }
 
         if direction not in angle_ranges:
             return None
 
-        min_dist = float('inf')
+        # Минимальное доверительное расстояние лидара — точки ближе считаются шумом
+        LIDAR_MIN_RELIABLE_DIST = 0.12  # 12 см — ближе этого T-MINI Plus шумит
+
+        sector_distances = []
 
         for angle, distance in scan_data:
-            # Нормализуем угол
+            # Отбрасываем заведомо шумные точки (слишком близкие)
+            if distance < LIDAR_MIN_RELIABLE_DIST:
+                continue
+
             angle = self._normalize_angle(angle)
 
-            # Для 'back' обрабатываем переход через ±π отдельно
             if direction == 'back':
-                # Задняя полусфера: |angle| > 5π/6 (~150°)
                 if abs(angle) > 5 * np.pi / 6:
-                    if 0 < distance < min_dist:
-                        min_dist = distance
+                    sector_distances.append(distance)
             else:
                 min_angle, max_angle = angle_ranges[direction]
                 if min_angle <= angle <= max_angle:
-                    if 0 < distance < min_dist:
-                        min_dist = distance
+                    sector_distances.append(distance)
 
-        return min_dist if min_dist != float('inf') else None
+        if not sector_distances:
+            return None
+
+        # Медианная фильтрация: берём медиану нижних 25% точек (ближайших),
+        # но только если их достаточно (минимум 3 точки), иначе — одиночный выброс
+        sector_distances.sort()
+        if len(sector_distances) < 3:
+            # Мало точек — недостаточно данных, не доверяем
+            return None
+
+        # Берём нижний квартиль и считаем его медиану
+        q1_count = max(3, len(sector_distances) // 4)
+        closest_points = sector_distances[:q1_count]
+        median_dist = float(np.median(closest_points))
+
+        return median_dist
 
     def _estimate_distance_from_segmentation(self, mask, direction: str) -> Optional[float]:
         """Оценка расстояния на основе сегментации"""
