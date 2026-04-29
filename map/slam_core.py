@@ -387,6 +387,41 @@ class SLAM:
         n_bins = 100
         cmap = mcolors.LinearSegmentedColormap.from_list('occupancy', colors, N=n_bins)
 
+        # Авто-кроп: показываем только исследованную область + историю позиций,
+        # иначе при сетке 400x400 (20x20 м) полезная зона 1–3 м выглядит крошечной.
+        # Тут это влияет ТОЛЬКО на extent для imshow — координаты ячеек не меняем.
+        margin = 20  # ячеек вокруг исследованной области
+        explored_mask = np.abs(display_map - 50.0) > 1.0  # клетки, обновлённые SLAM
+        ys_e, xs_e = np.where(explored_mask)
+        # учитываем траекторию робота, чтобы робот всегда попал в кадр
+        path_gx = []
+        path_gy = []
+        for pos in self.position_history:
+            gx, gy = self.map.world_to_grid(pos.x, pos.y)
+            if 0 <= gx < width and 0 <= gy < height:
+                path_gx.append(gx)
+                path_gy.append(gy)
+
+        if len(xs_e) > 0 or path_gx:
+            x_min = min((xs_e.min() if len(xs_e) else width), min(path_gx) if path_gx else width)
+            x_max = max((xs_e.max() if len(xs_e) else 0), max(path_gx) if path_gx else 0)
+            y_min = min((ys_e.min() if len(ys_e) else height), min(path_gy) if path_gy else height)
+            y_max = max((ys_e.max() if len(ys_e) else 0), max(path_gy) if path_gy else 0)
+            x_min = max(0, x_min - margin)
+            x_max = min(width, x_max + margin)
+            y_min = max(0, y_min - margin)
+            y_max = min(height, y_max + margin)
+            # квадратное окно, чтобы масштаб по осям был одинаковый
+            side = max(x_max - x_min, y_max - y_min)
+            cx = (x_min + x_max) // 2
+            cy = (y_min + y_max) // 2
+            x_min = max(0, cx - side // 2)
+            x_max = min(width, x_min + side)
+            y_min = max(0, cy - side // 2)
+            y_max = min(height, y_min + side)
+        else:
+            x_min, x_max, y_min, y_max = 0, width, 0, height
+
         extent = [0, width, 0, height]
         im1 = ax1.imshow(display_map, cmap=cmap, origin='lower',
                         vmin=0, vmax=100, extent=extent, interpolation='nearest')
@@ -417,6 +452,9 @@ class SLAM:
         ax1.set_title(f"SLAM карта\nРазрешение: {self.map.resolution}м/ячейка", fontsize=14, fontweight='bold')
         ax1.set_xlabel("Ячейки сетки (X)", fontsize=12)
         ax1.set_ylabel("Ячейки сетки (Y)", fontsize=12)
+        ax1.set_xlim(x_min, x_max)
+        ax1.set_ylim(y_min, y_max)
+        ax1.set_aspect('equal')
         ax1.legend(loc='upper right', fontsize=10)
         ax1.grid(True, alpha=0.2, linestyle='--', color='white')
 
@@ -449,6 +487,9 @@ class SLAM:
         ax2.set_title("Бинарная карта (упрощенная)", fontsize=14, fontweight='bold')
         ax2.set_xlabel("Ячейки сетки (X)", fontsize=12)
         ax2.set_ylabel("Ячейки сетки (Y)", fontsize=12)
+        ax2.set_xlim(x_min, x_max)
+        ax2.set_ylim(y_min, y_max)
+        ax2.set_aspect('equal')
         ax2.grid(True, alpha=0.3, linestyle='--')
 
         # Colorbar для бинарной карты

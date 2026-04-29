@@ -126,9 +126,8 @@ class NavigationController:
       try:
           sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
           from lidar import LidarDriver
-  
-          # Пробуем подключиться к лидару на разных портах
-          ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']  # ← /dev/ttyUSB1 ПЕРВЫМ!
+
+          ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']
   
           for port in ports:
               try:
@@ -194,15 +193,8 @@ class NavigationController:
         Основной цикл обновления
         Должен вызываться регулярно
         """
-        current_time = time.time()
-        dt = current_time - self.last_update_time
-        self.last_update_time = current_time
-
-        # Обновляем данные сенсоров
-        self._update_sensors()
-
-        # Обновляем одометрию (примерно)
-        self._update_odometry(dt)
+        # Сенсоры + одометрия одной точкой входа (см. _tick)
+        self._tick()
 
         # Выполняем действия в зависимости от режима
         if self.mode == NavigationMode.EXPLORATION:
@@ -257,53 +249,64 @@ class NavigationController:
             except Exception as e:
                 pass  # Игнорируем ошибки камеры
 
+    # ===== Калибровка одометрии =====
+    # PWM в car_adapter — диапазон 0..255 (см. set_deflection в car_adapter.py).
+    # Эти константы нужно подкалибровать под реального робота:
+    #   1) Запустить move_forward(PWM_FULL) на 1 сек, измерить пройденное расстояние → MAX_LINEAR_SPEED.
+    #   2) Запустить rotate_left(PWM_FULL) на 1 сек, измерить угол поворота (рад) → MAX_ANGULAR_SPEED.
+    PWM_FULL = 255.0
+    MAX_LINEAR_SPEED = 0.6   # м/с при PWM=255 (вперёд/назад)
+    MAX_ANGULAR_SPEED = 3.0  # рад/с при PWM=255 (поворот на месте)
+    WHEEL_BASE = 0.15        # м, эквивалентная база для diff-drive модели
+
     def _update_odometry(self, dt: float):
         """
-        Обновление одометрии на основе команд движения
+        Обновление одометрии на основе текущей команды движения.
+        Должен вызываться часто во время движения (см. _tick).
         """
-        # Параметры робота (примерные)
-        max_speed = 0.15  # УМЕНЬШЕННАЯ максимальная скорость м/с при PWM=100
-        wheel_base = 0.15  # расстояние между колесами в метрах
+        if dt <= 0.0:
+            return
 
-        # Преобразуем PWM (0-100) в скорость (м/с)
-        speed_factor = self.current_speed / 100.0
-        linear_speed = max_speed * speed_factor
+        # PWM в car_adapter лежит в диапазоне 0..255, current_speed хранится так же.
+        pwm_factor = min(1.0, max(0.0, self.current_speed / self.PWM_FULL))
+        v_max = self.MAX_LINEAR_SPEED * pwm_factor
+        omega_max = self.MAX_ANGULAR_SPEED * pwm_factor
 
-        # Оценка скоростей левых и правых колес на основе команды
-        if self.current_command == "forward":
-            left_speed = linear_speed
-            right_speed = linear_speed
+        cmd = self.current_command
 
-        elif self.current_command == "backward":
-            left_speed = -linear_speed
-            right_speed = -linear_speed
+        if cmd == "forward":
+            v, omega = v_max, 0.0
+        elif cmd == "backward":
+            v, omega = -v_max, 0.0
+        elif cmd == "rotate_left":
+            v, omega = 0.0, omega_max
+        elif cmd == "rotate_right":
+            v, omega = 0.0, -omega_max
+        else:
+            # stop, либо боковое мекалум-движение — в одометрии не учитываем
+            v, omega = 0.0, 0.0
 
-        elif self.current_command == "rotate_left":
-            # Поворот на месте влево
-            left_speed = -linear_speed * 0.5
-            right_speed = linear_speed * 0.5
+        # Конвертация (v, omega) → скорости бортов для diff-drive модели в SLAM.
+        # SLAM сам пересчитает обратно: v=(l+r)/2, omega=(r-l)/wheel_base.
+        half_base = self.WHEEL_BASE / 2.0
+        left_speed = v - omega * half_base
+        right_speed = v + omega * half_base
 
-        elif self.current_command == "rotate_right":
-            # Поворот на месте вправо
-            left_speed = linear_speed * 0.5
-            right_speed = -linear_speed * 0.5
-
-        elif self.current_command == "left":
-            # Движение влево (омни-колеса)
-            left_speed = -linear_speed * 0.3
-            right_speed = linear_speed * 0.3
-
-        elif self.current_command == "right":
-            # Движение вправо (омни-колеса)
-            left_speed = linear_speed * 0.3
-            right_speed = -linear_speed * 0.3
-
-        else:  # stop или неизвестная команда
-            left_speed = 0.0
-            right_speed = 0.0
-
-        # Обновляем SLAM
         self.slam.update_odometry(left_speed, right_speed, dt)
+
+    def _tick(self, dt_max: float = 0.5):
+        """
+        Один шаг обновления: сенсоры + одометрия + SLAM.
+        Должен вызываться периодически и из блокирующих помощников движения,
+        чтобы одометрия накапливалась пока команда активна.
+        """
+        now = time.time()
+        dt = now - self.last_update_time
+        if dt > dt_max:
+            dt = dt_max  # защита от больших dt после блокирующих участков
+        self.last_update_time = now
+        self._update_sensors()
+        self._update_odometry(dt)
 
     def _set_movement_command(self, command: str, speed: int):
         """
@@ -335,13 +338,17 @@ class NavigationController:
         print(f"[SAFE_MOVE] Начинаю движение вперед на {max_duration:.1f}с")
         ca.move_forward(self.exploration_speed)
         self._set_movement_command("forward", self.exploration_speed)
-        
+        # Сбрасываем точку отсчёта одометрии: интегрируем "forward" с этого момента
+        self.last_update_time = time.time()
+
         try:
             while time.time() - start_time < max_duration:
                 # Ждем до следующей проверки
                 time.sleep(check_interval)
+                # Тикаем SLAM/одометрию пока движемся, иначе позиция/угол не накапливаются
+                self._tick()
                 check_count += 1
-                
+
                 # Проверяем датчики
                 obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
                 
@@ -430,11 +437,14 @@ class NavigationController:
         # Медленный поворот
         ca.rotate_left(self.turn_speed)
         self._set_movement_command("rotate_left", self.turn_speed)
-        
+        self.last_update_time = time.time()
+
         try:
             while time.time() - start_time < max_duration:
                 time.sleep(check_interval)
-                
+                # Накапливаем угол одометрии пока крутимся
+                self._tick()
+
                 # Проверяем, не стало ли что-то слишком близко спереди
                 distance = self.sensor_fusion.get_obstacle_distance('front')
                 if distance and distance < self.critical_distance:
@@ -460,11 +470,13 @@ class NavigationController:
         
         ca.rotate_right(self.turn_speed)
         self._set_movement_command("rotate_right", self.turn_speed)
-        
+        self.last_update_time = time.time()
+
         try:
             while time.time() - start_time < max_duration:
                 time.sleep(check_interval)
-                
+                self._tick()
+
                 distance = self.sensor_fusion.get_obstacle_distance('front')
                 if distance and distance < self.critical_distance:
                     print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
@@ -485,21 +497,34 @@ class NavigationController:
     def _emergency_stop_and_back(self):
         """Экстренная остановка и отъезд назад"""
         print("[SAFETY] ⚠️ ЭКСТРЕННАЯ ОСТАНОВКА!")
-        
+
         # Немедленная остановка
         ca.stop_robot()
         self._set_movement_command("stop", 0)
         time.sleep(0.3)
-        
-        # Отъезжаем немного назад
+
+        # Отъезжаем немного назад с накоплением одометрии
         print("[SAFETY] Отъезжаю назад...")
         ca.move_backward(self.exploration_speed)
         self._set_movement_command("backward", self.exploration_speed)
-        time.sleep(0.8)
-        
+        self.last_update_time = time.time()
+        self._timed_drive(0.8, check_interval=0.2)
+
         ca.stop_robot()
         self._set_movement_command("stop", 0)
         time.sleep(0.3)
+
+    def _timed_drive(self, duration: float, check_interval: float = 0.2):
+        """
+        Выполнить уже стартованную команду в течение duration секунд,
+        тикая одометрию/SLAM. Команду должны выставить ДО вызова.
+        """
+        end = time.time() + duration
+        while time.time() < end:
+            sleep_for = min(check_interval, max(0.0, end - time.time()))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            self._tick()
 
     # ===== БЕЗОПАСНЫЕ ПОВЕДЕНИЯ =====
 
@@ -555,11 +580,12 @@ class NavigationController:
                 print("[NAV_DEBUG] ⚠️ Зацикливание на поворотах! Пробую объезд...")
                 self.consecutive_rotations = 0
 
-                # Отъезжаем назад
+                # Отъезжаем назад с тиками одометрии
                 print("[NAV_DEBUG] Отъезжаю назад...")
                 ca.move_backward(self.exploration_speed)
                 self._set_movement_command("backward", self.exploration_speed)
-                time.sleep(0.7)
+                self.last_update_time = time.time()
+                self._timed_drive(0.7)
                 ca.stop_robot()
                 self._set_movement_command("stop", 0)
                 time.sleep(0.3)
@@ -659,7 +685,7 @@ class NavigationController:
             # Двигаемся короткими отрезками с проверкой
             move_success = True
             move_start = time.time()
-            
+
             while move_success and time.time() - move_start < 1.5:
                 # Проверяем перед движением
                 check_dist = self.sensor_fusion.get_obstacle_distance('front')
@@ -667,12 +693,13 @@ class NavigationController:
                     print(f"[NavController] Препятствие на пути: {check_dist:.2f}м")
                     move_success = False
                     break
-                
-                # Двигаемся короткий отрезок
+
+                # Двигаемся короткий отрезок с тиком одометрии
                 ca.move_forward(self.navigation_speed)
                 self._set_movement_command("forward", self.navigation_speed)
-                time.sleep(0.3)
-                
+                self.last_update_time = time.time()
+                self._timed_drive(0.3, check_interval=0.1)
+
                 # Проверяем снова
                 check_dist = self.sensor_fusion.get_obstacle_distance('front')
                 if check_dist and check_dist < self.min_obstacle_distance:
@@ -699,7 +726,8 @@ class NavigationController:
         print("[NavController] Отъезжаю назад...")
         ca.move_backward(self.exploration_speed)
         self._set_movement_command("backward", self.exploration_speed)
-        time.sleep(0.5)
+        self.last_update_time = time.time()
+        self._timed_drive(0.5)
         ca.stop_robot()
         self._set_movement_command("stop", 0)
         time.sleep(0.3)

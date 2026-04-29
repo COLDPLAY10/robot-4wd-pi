@@ -13,6 +13,9 @@ import os
 import pickle
 import numpy as np
 
+# Делаем пакет 'map' импортируемым: pickle хранит ссылки на map.slam_core.Position и т.д.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Проверка наличия matplotlib
 try:
     import matplotlib.pyplot as plt
@@ -62,6 +65,39 @@ def visualize_map(map_data: dict, save_path: str = None):
     display_grid = 255 - (display_grid * 2.55)  # инвертируем для отображения
 
     ax.imshow(display_grid, cmap='gray', origin='lower', vmin=0, vmax=255)
+
+    # Авто-кроп вокруг исследованной области и траектории — иначе при сетке 400x400
+    # мапа выглядит крошечной точкой посреди серого поля.
+    height, width = grid.shape
+    explored_mask = np.abs(grid - 50.0) > 1.0
+    ys_e, xs_e = np.where(explored_mask)
+    path_gx = []
+    path_gy = []
+    for pose in pose_history:
+        gx, gy = world_to_grid(pose.x, pose.y, origin_x, origin_y, resolution)
+        if 0 <= gx < width and 0 <= gy < height:
+            path_gx.append(gx)
+            path_gy.append(gy)
+    margin = 20
+    if len(xs_e) > 0 or path_gx:
+        x_min = min((xs_e.min() if len(xs_e) else width), min(path_gx) if path_gx else width)
+        x_max = max((xs_e.max() if len(xs_e) else 0), max(path_gx) if path_gx else 0)
+        y_min = min((ys_e.min() if len(ys_e) else height), min(path_gy) if path_gy else height)
+        y_max = max((ys_e.max() if len(ys_e) else 0), max(path_gy) if path_gy else 0)
+        x_min = max(0, int(x_min) - margin)
+        x_max = min(width, int(x_max) + margin)
+        y_min = max(0, int(y_min) - margin)
+        y_max = min(height, int(y_max) + margin)
+        side = max(x_max - x_min, y_max - y_min)
+        cx = (x_min + x_max) // 2
+        cy = (y_min + y_max) // 2
+        x_min = max(0, cx - side // 2)
+        x_max = min(width, x_min + side)
+        y_min = max(0, cy - side // 2)
+        y_max = min(height, y_min + side)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min, y_max)
+    ax.set_aspect('equal')
 
     # Отображение начала координат
     ax.plot(origin_x, origin_y, 'go', markersize=10, label='Начало координат')
