@@ -1,437 +1,305 @@
 #!/usr/bin/env python3
+"""
+Драйвер для лидара Yahboom T-Mini Plus (Oradar MS200).
+
+API совместим со старым lidar.py — класс LidarDriver с методами
+connect, start_scan, get_scan, get_scan_degrees, stop_scan, disconnect,
+print_scan_info, force_stop.
+
+Протокол MS200 (47-байтный фрейм):
+  byte  0       : 0x54 (header)
+  byte  1       : 0x2C (ver=2, points=12)
+  bytes 2-3     : speed, uint16 LE (deg/s; делить на 360 -> Hz)
+  bytes 4-5     : start_angle, uint16 LE (0.01°)
+  bytes 6-41    : 12 точек × (uint16 distance_mm, uint8 confidence)
+  bytes 42-43   : end_angle, uint16 LE (0.01°)
+  bytes 44-45   : timestamp, uint16 LE
+  byte  46      : crc8
+"""
+
+import math
+import os
+import struct
+import threading
+import time
+from typing import List, Optional, Tuple
 
 import serial
-import time
-import math
-import threading
-from typing import List, Tuple, Optional
+
+
+FRAME_HEADER = 0x54
+FRAME_VER_LEN = 0x2C
+POINTS_PER_FRAME = 12
+FRAME_SIZE = 47
+
+_CRC_TABLE = bytes([
+    0x00, 0x4d, 0x9a, 0xd7, 0x79, 0x34, 0xe3, 0xae, 0xf2, 0xbf, 0x68, 0x25,
+    0x8b, 0xc6, 0x11, 0x5c, 0xa9, 0xe4, 0x33, 0x7e, 0xd0, 0x9d, 0x4a, 0x07,
+    0x5b, 0x16, 0xc1, 0x8c, 0x22, 0x6f, 0xb8, 0xf5, 0x1f, 0x52, 0x85, 0xc8,
+    0x66, 0x2b, 0xfc, 0xb1, 0xed, 0xa0, 0x77, 0x3a, 0x94, 0xd9, 0x0e, 0x43,
+    0xb6, 0xfb, 0x2c, 0x61, 0xcf, 0x82, 0x55, 0x18, 0x44, 0x09, 0xde, 0x93,
+    0x3d, 0x70, 0xa7, 0xea, 0x3e, 0x73, 0xa4, 0xe9, 0x47, 0x0a, 0xdd, 0x90,
+    0xcc, 0x81, 0x56, 0x1b, 0xb5, 0xf8, 0x2f, 0x62, 0x97, 0xda, 0x0d, 0x40,
+    0xee, 0xa3, 0x74, 0x39, 0x65, 0x28, 0xff, 0xb2, 0x1c, 0x51, 0x86, 0xcb,
+    0x21, 0x6c, 0xbb, 0xf6, 0x58, 0x15, 0xc2, 0x8f, 0xd3, 0x9e, 0x49, 0x04,
+    0xaa, 0xe7, 0x30, 0x7d, 0x88, 0xc5, 0x12, 0x5f, 0xf1, 0xbc, 0x6b, 0x26,
+    0x7a, 0x37, 0xe0, 0xad, 0x03, 0x4e, 0x99, 0xd4, 0x7c, 0x31, 0xe6, 0xab,
+    0x05, 0x48, 0x9f, 0xd2, 0x8e, 0xc3, 0x14, 0x59, 0xf7, 0xba, 0x6d, 0x20,
+    0xd5, 0x98, 0x4f, 0x02, 0xac, 0xe1, 0x36, 0x7b, 0x27, 0x6a, 0xbd, 0xf0,
+    0x5e, 0x13, 0xc4, 0x89, 0x63, 0x2e, 0xf9, 0xb4, 0x1a, 0x57, 0x80, 0xcd,
+    0x91, 0xdc, 0x0b, 0x46, 0xe8, 0xa5, 0x72, 0x3f, 0xca, 0x87, 0x50, 0x1d,
+    0xb3, 0xfe, 0x29, 0x64, 0x38, 0x75, 0xa2, 0xef, 0x41, 0x0c, 0xdb, 0x96,
+    0x42, 0x0f, 0xd8, 0x95, 0x3b, 0x76, 0xa1, 0xec, 0xb0, 0xfd, 0x2a, 0x67,
+    0xc9, 0x84, 0x53, 0x1e, 0xeb, 0xa6, 0x71, 0x3c, 0x92, 0xdf, 0x08, 0x45,
+    0x19, 0x54, 0x83, 0xce, 0x60, 0x2d, 0xfa, 0xb7, 0x5d, 0x10, 0xc7, 0x8a,
+    0x24, 0x69, 0xbe, 0xf3, 0xaf, 0xe2, 0x35, 0x78, 0xd6, 0x9b, 0x4c, 0x01,
+    0xf4, 0xb9, 0x6e, 0x23, 0x8d, 0xc0, 0x17, 0x5a, 0x06, 0x4b, 0x9c, 0xd1,
+    0x7f, 0x32, 0xe5, 0xa8,
+])
+
+
+def _crc8(buf: bytes) -> int:
+    crc = 0
+    for b in buf:
+        crc = _CRC_TABLE[(crc ^ b) & 0xFF]
+    return crc
+
+
+def _resolve_port(preferred: str) -> str:
+    if preferred and os.path.exists(preferred):
+        return preferred
+    for fallback in ('/dev/oradar', '/dev/ttyACM0', '/dev/ttyACM1'):
+        if os.path.exists(fallback):
+            return fallback
+    return preferred
 
 
 class LidarDriver:
-    """
-    Исправленный драйвер для T-MINI Plus
-    """
-    
-    def __init__(self, port='/dev/ttyUSB1', baudrate=230400):
-        self.port = port
+    """Драйвер MS200 (T-Mini Plus). Стримит точки, собирает их в полные обороты."""
+
+    def __init__(self, port: str = '/dev/ttyACM0', baudrate: int = 230400,
+                 timeout: float = 1.0,
+                 min_distance_m: float = 0.05, max_distance_m: float = 12.0,
+                 min_confidence: int = 10):
+        self.port = _resolve_port(port)
         self.baudrate = baudrate
-        self.serial = None
+        self.timeout = timeout
+        self.min_distance_m = min_distance_m
+        self.max_distance_m = max_distance_m
+        self.min_confidence = min_confidence
+
+        self.serial: Optional[serial.Serial] = None
         self.is_running = False
-        self.scan_data = []
+        self._thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
-        
-        # Для отладки
+
+        self.scan_data: List[Tuple[float, float]] = []
+        self._current_rotation: List[Tuple[float, float, int]] = []
+        self._prev_angle_deg: Optional[float] = None
+
         self.packet_count = 0
-        self.angle_test_results = []
-        
-        print(f"[Lidar] Инициализация на {port}, скорость {baudrate}")
-    def connect(self):
-        """Подключение"""
+        self.bad_crc_count = 0
+        self.speed_hz = 0.0
+
+        print(f"[Lidar] MS200 на {self.port} @ {baudrate}")
+
+    def connect(self) -> bool:
         try:
             self.serial = serial.Serial(
                 port=self.port,
                 baudrate=self.baudrate,
-                timeout=0.1,
+                timeout=self.timeout,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE
+                stopbits=serial.STOPBITS_ONE,
             )
-            
-            time.sleep(0.5)
+            time.sleep(0.2)
             self.serial.reset_input_buffer()
             print(f"[Lidar] Подключено к {self.port}")
             return True
-            
         except Exception as e:
-            print(f"[Lidar] Ошибка подключения: {e}")
+            print(f"[Lidar] Ошибка подключения к {self.port}: {e}")
             return False
 
-    def start_scan(self):
-        """Запуск сканирования"""
+    def start_scan(self) -> bool:
         if not self.serial or not self.serial.is_open:
             if not self.connect():
                 return False
-        
-        try:
-            print("[Lidar] Запуск сканирования...")
-            
-            # Стандартные команды для T-MINI
-            self.serial.write(b'\xA5\x65')  # Stop
-            time.sleep(0.1)
-            self.serial.reset_input_buffer()
-            
-            self.serial.write(b'\xA5\x52')  # Motor on
-            time.sleep(1.0)  # Даем время на раскрутку
-            
-            self.serial.write(b'\xA5\x60')  # Start scan
-            time.sleep(0.2)
-            
-            # Запускаем поток чтения
-            self.is_running = True
-            thread = threading.Thread(target=self._read_thread, daemon=True)
-            thread.start()
-            
-            print("[Lidar] Сканирование запущено")
-            return True
-            
-        except Exception as e:
-            print(f"[Lidar] Ошибка запуска: {e}")
-            return False
 
-    def _read_thread(self):
-        """Поток чтения данных"""
-        buffer = bytearray()
-        
+        # MS200 льёт данные сама как только подаётся питание — никаких команд запуска не нужно.
+        self.is_running = True
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        print("[Lidar] Чтение запущено")
+        return True
+
+    def _read_loop(self):
+        buf = bytearray()
         while self.is_running and self.serial and self.serial.is_open:
             try:
-                # Читаем данные
-                if self.serial.in_waiting:
-                    data = self.serial.read(self.serial.in_waiting)
-                    buffer.extend(data)
-                
-                # Обрабатываем пакеты
-                while len(buffer) >= 9:
-                    # Ищем заголовок AA 55
-                    if buffer[0] == 0xAA and buffer[1] == 0x55:
-                        packet = bytes(buffer[:9])
-                        self._parse_packet_fixed(packet)
-                        buffer = buffer[9:]
-                        self.packet_count += 1
-                    else:
-                        # Пропускаем 1 байт
-                        buffer = buffer[1:]
-                
-                time.sleep(0.001)
-                
+                chunk = self.serial.read(256)
+                if chunk:
+                    buf.extend(chunk)
+
+                while len(buf) >= FRAME_SIZE:
+                    idx = self._find_header(buf)
+                    if idx < 0:
+                        del buf[:-1]
+                        break
+                    if idx > 0:
+                        del buf[:idx]
+                    if len(buf) < FRAME_SIZE:
+                        break
+
+                    frame = bytes(buf[:FRAME_SIZE])
+                    if _crc8(frame[:FRAME_SIZE - 1]) != frame[FRAME_SIZE - 1]:
+                        self.bad_crc_count += 1
+                        del buf[0]
+                        continue
+
+                    self._parse_frame(frame)
+                    del buf[:FRAME_SIZE]
+                    self.packet_count += 1
+
             except Exception as e:
-                print(f"[ERROR] В потоке чтения: {e}")
-                buffer.clear()
-                time.sleep(0.1)
+                print(f"[Lidar] Ошибка в потоке: {e}")
+                time.sleep(0.05)
 
-    def _parse_packet_fixed(self, packet):
-        """
-        Парсинг пакета T-MINI Plus
-        """
-        if len(packet) != 9:
-            return
+    @staticmethod
+    def _find_header(buf: bytearray) -> int:
+        i = 0
+        end = len(buf) - 1
+        while i < end:
+            if buf[i] == FRAME_HEADER and buf[i + 1] == FRAME_VER_LEN:
+                return i
+            i += 1
+        return -1
 
-        if self.packet_count < 5:
-            self._analyze_packet(packet)
+    def _parse_frame(self, frame: bytes):
+        speed = struct.unpack_from('<H', frame, 2)[0]
+        start_angle_raw = struct.unpack_from('<H', frame, 4)[0]
+        end_angle_raw = struct.unpack_from('<H', frame, 42)[0]
 
-        distance_mm = packet[4] | (packet[5] << 8)
+        self.speed_hz = speed / 360.0
 
-        angle_deg_v1 = packet[6] * 360.0 / 256.0
+        diff = (end_angle_raw + 36000 - start_angle_raw) % 36000
+        step_deg = (diff / (POINTS_PER_FRAME - 1)) / 100.0
+        start_deg = start_angle_raw / 100.0
 
-        angle_raw = packet[6] | (packet[7] << 8)
-        angle_deg_v2 = (angle_raw / 100.0) % 360.0
+        for i in range(POINTS_PER_FRAME):
+            off = 6 + i * 3
+            distance_mm, confidence = struct.unpack_from('<HB', frame, off)
 
-        if abs(angle_deg_v1 - 102.4) > 5 and abs(angle_deg_v1 - 56.25) > 5:
-            angle_deg = angle_deg_v1
-        elif abs(angle_deg_v2 - 102.4) > 5 and abs(angle_deg_v2 - 56.25) > 5:
-            angle_deg = angle_deg_v2
-        else:
-            angle_deg = angle_deg_v1
+            angle_deg = start_deg + i * step_deg
+            if angle_deg >= 360.0:
+                angle_deg -= 360.0
 
-        distance_m = distance_mm / 1000.0
+            # Детектируем переход через 0° → завершение оборота.
+            # Делаем это до фильтра, чтобы момент wrap'а не зависел от качества точки.
+            if (self._prev_angle_deg is not None and
+                    self._prev_angle_deg - angle_deg > 180.0):
+                if self._current_rotation:
+                    with self.lock:
+                        self.scan_data = [
+                            (math.radians(a), d) for a, d, _ in self._current_rotation
+                        ]
+                    self._current_rotation = []
+            self._prev_angle_deg = angle_deg
 
-        if 0.05 <= distance_m <= 6.0:
-            angle_rad = math.radians(angle_deg)
+            distance_m = distance_mm / 1000.0
+            if (confidence < self.min_confidence or
+                    distance_m < self.min_distance_m or
+                    distance_m > self.max_distance_m):
+                continue
 
-            with self.lock:
-                self.scan_data.append((angle_rad, distance_m))
-                if len(self.scan_data) > 360:
-                    self.scan_data = self.scan_data[-360:]
-
-            if self.packet_count % 100 == 0:
-                print(f"[Lidar] Пакет {self.packet_count}: {angle_deg:.1f}° = {distance_m:.2f}м")
-
-    def _analyze_packet(self, packet):
-        """Анализ пакета для отладки"""
-        print(f"\n[DEBUG] Пакет {self.packet_count}:")
-        print(f"  HEX: {packet.hex()}")
-        print(f"  Байты: {' '.join([f'{b:02x}' for b in packet])}")
-
-        distance_mm = packet[4] | (packet[5] << 8)
-        angle_byte = packet[6]
-        angle_word = packet[6] | (packet[7] << 8)
-
-        print(f"  Расстояние: {distance_mm}мм = {distance_mm/10:.1f}см")
-        print(f"  Угол (байт6): {angle_byte} = {angle_byte*360/256:.1f}°")
-        print(f"  Угол (байт6-7): {angle_word} = {angle_word/100:.1f}°")
+            self._current_rotation.append((angle_deg, distance_m, confidence))
 
     def get_scan(self) -> List[Tuple[float, float]]:
-        """
-        Получить текущий скан в радианах (для совместимости с NavigationController)
-
-        Returns:
-            List[Tuple[float, float]]: список (угол_в_радианах, расстояние_в_метрах)
-        """
+        """Снимок последнего полного оборота: список (угол_рад, дистанция_м)."""
         with self.lock:
             return list(self.scan_data)
 
-    def get_scan_degrees(self):
-        """Получить скан в градусах"""
+    def get_scan_degrees(self) -> List[Tuple[float, float]]:
+        """То же, но угол в градусах, отсортировано по углу."""
         with self.lock:
-            # Конвертируем в градусы
-            scan_deg = [(math.degrees(a) % 360, d) for a, d in self.scan_data]
-            # Сортируем по углу
-            scan_deg.sort(key=lambda x: x[0])
-            return scan_deg
+            deg = [(math.degrees(a) % 360.0, d) for a, d in self.scan_data]
+        deg.sort(key=lambda x: x[0])
+        return deg
 
     def print_scan_info(self):
-        """Вывести информацию о скане"""
         scan = self.get_scan_degrees()
-        
         if not scan:
             print("[SCAN] Нет данных")
             return
-        
-        print(f"\n[SCAN] Всего точек: {len(scan)}")
 
-        angle_groups = {}
+        print(f"\n[SCAN] точек: {len(scan)}, скорость: {self.speed_hz:.1f} Гц, "
+              f"фреймов принято: {self.packet_count}, CRC ошибок: {self.bad_crc_count}")
+
+        groups: dict = {}
         for angle, dist in scan:
-            angle_int = int(round(angle))
-            if angle_int not in angle_groups:
-                angle_groups[angle_int] = []
-            angle_groups[angle_int].append(dist)
+            key = int(round(angle))
+            groups.setdefault(key, []).append(dist)
 
-        print("Углы с данными:")
-        angles_with_data = sorted(angle_groups.keys())
-        for angle in angles_with_data:
-            count = len(angle_groups[angle])
-            avg_dist = sum(angle_groups[angle]) / count
-            print(f"  {angle:3d}°: {count:3d} точек, среднее {avg_dist*100:5.1f} см")
-        
-        # Проверяем покрытие
-        if angles_with_data:
-            coverage = len(angles_with_data) / 360.0 * 100
-            print(f"\nПокрытие: {coverage:.1f}% ({len(angles_with_data)} из 360 градусов)")
-            
-            if coverage > 50:
-                print("✓ Лидар работает нормально")
-            else:
-                print("⚠ Лидар покрывает не весь круг")
+        for angle in sorted(groups.keys()):
+            ds = groups[angle]
+            print(f"  {angle:3d}°: {len(ds):3d} точек, среднее {sum(ds)/len(ds)*100:5.1f} см")
+
+        coverage = len(groups) / 360.0 * 100
+        print(f"\nПокрытие: {coverage:.1f}% ({len(groups)}/360 градусов)")
 
     def stop_scan(self):
-        """Остановка"""
         if not self.is_running:
             return
-        
-        print("[Lidar] Остановка...")
+        print("[Lidar] Остановка чтения...")
         self.is_running = False
-        time.sleep(0.2)
-
-        if self.serial and self.serial.is_open:
-            try:
-                self.serial.write(b'\xA5\x65')
-                time.sleep(0.1)
-                self.serial.write(b'\xA5\x50')
-                time.sleep(0.1)
-            except Exception as e:
-                print(f"[Lidar] Ошибка при остановке: {e}")
-
-        print("[Lidar] Сканирование остановлено")
+        if self._thread:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        print("[Lidar] Остановлено")
 
     def force_stop(self):
-        """Принудительная остановка (для экстренных случаев)"""
-        print("[Lidar] Принудительная остановка...")
         self.is_running = False
-
-        if self.serial and self.serial.is_open:
-            try:
-                for _ in range(3):
-                    self.serial.write(b'\xA5\x65')
-                    time.sleep(0.05)
-                    self.serial.write(b'\xA5\x50')
-                    time.sleep(0.05)
-            except:
-                pass
-
-        print("[Lidar] Остановлен")
+        self._thread = None
 
     def disconnect(self):
-        """Отключение"""
         self.stop_scan()
         if self.serial and self.serial.is_open:
-            self.serial.close()
-            print("[Lidar] Отключен")
-
-
-def test_angle_finding():
-    """Тест для поиска правильного угла"""
-    print("="*60)
-    print("ПОИСК ПРАВИЛЬНОГО УГЛА T-MINI PLUS")
-    print("="*60)
-    
-    testLidar = LidarDriver('/dev/ttyUSB1', 230400)
-
-    if not testLidar.connect():
-        print("Не удалось подключиться")
-        return
-    
-    print("\n1. Пробуем разные команды и смотрим ответ...")
-    
-    # Тестовые команды
-    test_commands = [
-        (b'\xA5\x52', "Включить мотор"),
-        (b'\xA5\x50', "Выключить мотор"),
-        (b'\xA5\x20', "Тестовая команда"),
-        (b'\xA5\x60', "Начать сканирование"),
-    ]
-    
-    for cmd, desc in test_commands:
-        print(f"  Отправка: {desc}")
-        testLidar.serial.write(cmd)
-        time.sleep(0.2)
-        
-        if testLidar.serial.in_waiting:
-            response = testLidar.serial.read(testLidar.serial.in_waiting)
-            print(f"    Ответ: {response.hex()[:50]}...")
-    
-    print("\n2. Запускаем сканирование и собираем данные...")
-    
-    if testLidar.start_scan():
-        print("Собираем данные 10 секунд...")
-        time.sleep(10)
-        
-        testLidar.stop_scan()
-        
-        print("\n3. Анализируем собранные данные...")
-        testLidar.print_scan_info()
-        
-        # Показываем примеры точек
-        scan = testLidar.get_scan_degrees()
-        if scan:
-            print("\nПримеры точек:")
-            step = max(1, len(scan) // 10)
-            for i in range(0, len(scan), step):
-                if i < len(scan):
-                    angle, dist = scan[i]
-                    print(f"  {angle:6.1f}°: {dist*100:5.1f} см")
-    else:
-        print("Не удалось запустить сканирование")
-    
-    testLidar.disconnect()
+            try:
+                self.serial.close()
+            except Exception:
+                pass
+            print("[Lidar] Порт закрыт")
 
 
 def test_simple_scan():
-    """Простой тест сканирования"""
-    print("="*60)
-    print("ПРОСТОЙ ТЕСТ СКАНИРОВАНИЯ")
-    print("="*60)
-    
-    testLidar = LidarDriver('/dev/ttyUSB1', 230400)
+    print("=" * 60)
+    print("ПРОСТОЙ ТЕСТ MS200")
+    print("=" * 60)
 
-    if not testLidar.connect():
+    lidar = LidarDriver()
+    if not lidar.start_scan():
+        print("Не удалось запустить")
         return
-    
-    if testLidar.start_scan():
-        try:
-            # Собираем данные
-            for i in range(20):  # 10 секунд
-                time.sleep(0.5)
-                
-                scan = testLidar.get_scan_degrees()
-                if scan:
-                    print(f"[{i+1}/20] Точек: {len(scan)}")
-                    
-                    # Минимальное расстояние
-                    if scan:
-                        dists = [d for _, d in scan]
-                        min_dist = min(dists) * 100  # в см
-                        max_dist = max(dists) * 100
-                        print(f"  Расстояния: {min_dist:.1f}-{max_dist:.1f} см")
-                        
-                        # Проверяем углы
-                        angles = [a for a, _ in scan]
-                        if angles:
-                            min_angle = min(angles)
-                            max_angle = max(angles)
-                            print(f"  Углы: {min_angle:.1f}°-{max_angle:.1f}°")
-                else:
-                    print(f"[{i+1}/20] Нет данных")
-                    
-        except KeyboardInterrupt:
-            print("\nПрервано пользователем")
-        finally:
-            testLidar.stop_scan()
-    else:
-        print("Не удалось запустить сканирование")
-    
-    testLidar.disconnect()
 
-
-def brute_force_angle_find():
-    """
-    Перебор всех возможных вариантов парсинга угла
-    """
-    print("="*60)
-    print("ПЕРЕБОР ВАРИАНТОВ УГЛА")
-    print("="*60)
-    
-    # Примеры пакетов из вашего лога
-    test_packets = [
-        "aa5500282da0b5a820",  # Пакет 0
-        "aa550028fba871b102",  # Пакет 1
-        "aa55000bb7b1010031",  # Пакет 2
-        "aa553101df2adf2a50",  # Пакет с углом 305 (0x0131)
-    ]
-    
-    for packet_hex in test_packets:
-        packet = bytes.fromhex(packet_hex)
-        print(f"\nАнализ пакета: {packet_hex}")
-        
-        # Перебираем все возможные варианты где может быть угол
-        for i in range(2, 9):  # Байты 2-8
-            # Вариант 1: один байт как угол (0-255 -> 0-360)
-            angle1 = packet[i] * 360.0 / 256.0
-            
-            # Вариант 2: два байта как угол (little-endian)
-            if i+1 < 9:
-                angle_word = packet[i] | (packet[i+1] << 8)
-                
-                # Разные преобразования
-                conversions = [
-                    ("/100", angle_word / 100.0),
-                    ("*360/65535", angle_word * 360.0 / 65535.0),
-                    ("/64", angle_word / 64.0),
-                    ("raw", angle_word),
-                ]
-                
-                for conv_name, angle_deg in conversions:
-                    if 0 <= angle_deg <= 360:
-                        # Проверяем, не постоянное ли это значение
-                        if abs(angle_deg - 102.4) > 0.1 and abs(angle_deg - 56.25) > 0.1:
-                            print(f"  Байты[{i}:{i+1}] {conv_name}: {angle_deg:.2f}° (сырое: {angle_word})")
-            
-            # Проверяем одиночный байт
-            if 0 <= angle1 <= 360 and abs(angle1 - 102.4) > 0.1:
-                print(f"  Байт[{i}] как угол: {angle1:.2f}° (значение: {packet[i]})")
+    try:
+        for i in range(20):
+            time.sleep(0.5)
+            scan = lidar.get_scan_degrees()
+            if scan:
+                dists = [d for _, d in scan]
+                angles = [a for a, _ in scan]
+                print(f"[{i+1}/20] точек: {len(scan)}  "
+                      f"дист: {min(dists)*100:.1f}-{max(dists)*100:.1f} см  "
+                      f"углы: {min(angles):.1f}-{max(angles):.1f}°  "
+                      f"скорость: {lidar.speed_hz:.1f} Гц")
+            else:
+                print(f"[{i+1}/20] нет данных")
+        lidar.print_scan_info()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        lidar.disconnect()
 
 
 if __name__ == '__main__':
-    print("Выберите тест:")
-    print("1. Поиск правильного угла (рекомендуется)")
-    print("2. Простой тест сканирования")
-    print("3. Перебор вариантов угла")
-    print("4. Проверить другой протокол (попробовать 115200)")
-    
-    choice = input("Введите 1-4: ").strip()
-    
-    if choice == '1':
-        test_angle_finding()
-    elif choice == '2':
-        test_simple_scan()
-    elif choice == '3':
-        brute_force_angle_find()
-    elif choice == '4':
-        # Пробуем другую скорость
-        print("\nПробуем скорость 115200...")
-        lidar = LidarDriver('/dev/ttyUSB1', 115200)
-        if lidar.connect():
-            print("✓ Подключено на 115200")
-            lidar.disconnect()
-        else:
-            print("✗ Не работает на 115200")
-    else:
-        test_angle_finding()
+    test_simple_scan()

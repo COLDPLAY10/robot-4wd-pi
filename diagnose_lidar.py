@@ -13,7 +13,7 @@ def check_uart_ports():
     print("ПРОВЕРКА UART ПОРТОВ")
     print("="*60)
 
-    ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']  # Изменил порядок, сначала USB
+    ports = ['/dev/oradar', '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']
     found_ports = []
 
     for port in ports:
@@ -153,10 +153,15 @@ def check_lidar_raw_data():
     try:
         import serial
         
-        port = '/dev/ttyUSB1'
-        if not os.path.exists(port):
-            print(f"✗ Порт {port} не найден")
+        port = None
+        for candidate in ('/dev/oradar', '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB1', '/dev/ttyUSB0'):
+            if os.path.exists(candidate):
+                port = candidate
+                break
+        if port is None:
+            print("✗ Ни один лидарный порт не найден (/dev/oradar, /dev/ttyACM0, ...)")
             return False
+        print(f"Используется порт: {port}")
             
         print(f"Открываю {port} на скорости 230400...")
         
