@@ -127,7 +127,8 @@ class NavigationController:
           sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
           from lidar import LidarDriver
 
-          ports = ['/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']
+          # Пробуем подключиться к лидару на разных портах
+          ports = ['/dev/oradar', '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB1', '/dev/ttyUSB0', '/dev/ttyAMA0', '/dev/ttyS0']
   
           for port in ports:
               try:
