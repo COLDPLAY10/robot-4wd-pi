@@ -7,8 +7,14 @@ numpy>=1.21.0
 # Работа с последовательными портами (лидар)
 pyserial>=3.5
 
-# Обработка видео с камеры
+# Обработка видео с камеры; cv2.distanceTransform используется
+# scan matcher'ом (map/scan_matcher.py) для построения likelihood field
 opencv-python>=4.5.0
+
+# Инференс Depth-Anything-V2 на Pi (camera_perception/depth_estimator.py).
+# На дев-машине для экспорта модели в ONNX нужны также torch и transformers
+# (см. scripts/setup_depth_model.py), но на Pi только onnxruntime.
+onnxruntime>=1.16.0
 
 # Визуализация карт (опционально, для visualize_map.py)
 matplotlib>=3.3.0

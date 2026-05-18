@@ -34,28 +34,44 @@ class NavigationController:
     Интегрирует SLAM, планирование и управление
     """
 
-    def __init__(self, use_lidar=False, use_camera=True, use_ultrasonic=True):
+    def __init__(self, use_lidar=False, use_camera=True, use_ultrasonic=True,
+                 mapping_mode='mapping', map_file=None):
         """
         Args:
             use_lidar: использовать лидар
             use_camera: использовать камеру
             use_ultrasonic: использовать ультразвуковой датчик
+            mapping_mode: 'mapping' — строим карту, 'localization' — едем по готовой
+            map_file: путь к .pkl карте; обязателен для localization, опционален
+                      для mapping (если задан — продолжаем уже существующую карту)
         """
         print("\n" + "="*60)
         print("ИНИЦИАЛИЗАЦИЯ СИСТЕМЫ НАВИГАЦИИ")
         print("="*60)
 
+        if mapping_mode == 'localization' and not map_file:
+            raise ValueError("Режим localization требует map_file с готовой картой")
+
         self.use_lidar = use_lidar
         self.use_camera = use_camera
         self.use_ultrasonic = use_ultrasonic
+        self.mapping_mode = mapping_mode
 
         # Инициализация компонентов
         self.slam = SLAM(
             map_width=400,
             map_height=400,
             resolution=0.05,
-            use_lidar=use_lidar
+            use_lidar=use_lidar,
+            mapping_mode=mapping_mode,
         )
+
+        # Загрузка карты — в localization обязательно, в mapping опционально
+        if map_file:
+            # В localization робота считаем стоящим в (0,0,0) на старте.
+            # В mapping подтягиваем последнюю позицию из истории, чтобы
+            # дополнять старую карту.
+            self.slam.load_map(map_file, reset_pose=(mapping_mode == 'localization'))
 
         self.sensor_fusion = SensorFusion(
             use_lidar=use_lidar,
@@ -110,6 +126,48 @@ class NavigationController:
         print("="*60)
         print("СИСТЕМА ГОТОВА К РАБОТЕ")
         print("="*60 + "\n")
+
+    # ===== Параметры камеры для depth-based perception =====
+    # На дев-машине без камеры можно тестировать через подмену camera_cap.
+    CAMERA_DEVICE_ID = 0           # /dev/video0 на Pi
+    CAMERA_WIDTH = 640
+    CAMERA_HEIGHT = 480
+    CAMERA_HFOV_DEG = 60.0         # типичный USB-веб для робота
+    CAMERA_MOUNT_HEIGHT_M = 0.10   # высота камеры над полом — измерить рулеткой
+    CAMERA_MOUNT_FORWARD_M = 0.05  # смещение вперёд от центра робота
+    CAMERA_MOUNT_TILT_RAD = 0.0    # 0 = горизонтально, >0 = смотрит вниз
+    CAMERA_PIXEL_STRIDE = 8        # обрабатывать каждый 8-й пиксель
+    CAMERA_MAX_RANGE_M = 2.5       # дальше глубина модели становится ненадёжной
+    DEPTH_MODEL_PATH = 'models/depth_anything_v2_small.onnx'
+
+    def _init_depth_perception(self):
+        """Инициализация камеры + модели глубины при первом обращении."""
+        from camera_perception import (DepthEstimator, CameraIntrinsics,
+                                        CameraMount)
+        try:
+            import cv2  # type: ignore
+            cap = cv2.VideoCapture(self.CAMERA_DEVICE_ID)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.CAMERA_HEIGHT)
+            if cap.isOpened():
+                self.camera_cap = cap
+                print(f"[NavController] Камера открыта: "
+                      f"{self.CAMERA_WIDTH}×{self.CAMERA_HEIGHT}")
+            else:
+                self.camera_cap = None
+                print("[NavController] Камера не открылась — perception отключён")
+        except Exception as e:
+            self.camera_cap = None
+            print(f"[NavController] Ошибка камеры: {e}")
+
+        self.depth_estimator = DepthEstimator(model_path=self.DEPTH_MODEL_PATH)
+        self.camera_intrinsics = CameraIntrinsics.from_fov(
+            self.CAMERA_WIDTH, self.CAMERA_HEIGHT, hfov_deg=self.CAMERA_HFOV_DEG)
+        self.camera_mount = CameraMount(
+            height_m=self.CAMERA_MOUNT_HEIGHT_M,
+            forward_offset_m=self.CAMERA_MOUNT_FORWARD_M,
+            tilt_rad=self.CAMERA_MOUNT_TILT_RAD,
+        )
 
     def _init_sensors(self):
         """Инициализация датчиков"""
@@ -233,20 +291,24 @@ class NavigationController:
             except Exception as e:
                 pass  # Игнорируем ошибки чтения лидара
 
-        # Камера и сегментация
+        # Камера: Depth-Anything-V2 → обратная проекция → occupancy grid.
+        # Сегментация "пол/стены" удалена как нерабочая на 46-кадровом датасете.
         if self.use_camera:
             try:
-                # Инициализируем камеру при первом вызове
-                if not hasattr(self, 'camera_seg'):
-                    from camera_segmentation import CameraSegmentation
-                    self.camera_seg = CameraSegmentation()
+                # Инициализация при первом вызове: cv2.VideoCapture + ONNX-модель.
+                if not hasattr(self, 'depth_estimator'):
+                    self._init_depth_perception()
 
-                # Получаем маску сегментации
-                segmentation = self.camera_seg.get_segmentation_mask()
-
-                if segmentation is not None:
-                    self.sensor_fusion.update_camera(segmentation)
-                    self.slam.update_with_camera_segmentation(segmentation)
+                if self.camera_cap is not None:
+                    ret, frame = self.camera_cap.read()
+                    if ret and frame is not None:
+                        depth = self.depth_estimator.get_depth_map(frame)
+                        if depth is not None:
+                            self.slam.update_with_camera_depth(
+                                depth, self.camera_intrinsics, self.camera_mount,
+                                pixel_stride=self.CAMERA_PIXEL_STRIDE,
+                                max_range_m=self.CAMERA_MAX_RANGE_M,
+                            )
             except Exception as e:
                 pass  # Игнорируем ошибки камеры
 
@@ -422,79 +484,60 @@ class NavigationController:
             
         return safe
 
-    def _safe_rotate_left(self, max_duration=1.0, check_interval=0.2):
+    def _safe_rotate(self, direction: str,
+                     max_duration: float = 1.0,
+                     check_interval: float = 0.2) -> bool:
         """
-        Безопасный поворот налево с проверкой
-        
+        Безопасный поворот на месте: крутимся ≤ max_duration, прерываемся если
+        что-то подъехало ближе critical_distance впереди. Одометрия тикает
+        каждый check_interval, так что угол доезжает до SLAM/scan-matcher'а.
+
         Args:
-            max_duration: максимальное время поворота (сек)
-            check_interval: интервал проверки (сек)
-        
+            direction: 'left' | 'right'
+            max_duration: предел времени поворота, сек
+            check_interval: период тика и проверки сенсоров, сек
+
         Returns:
-            bool: True если поворот завершен безопасно
+            True если поворот завершён без срабатывания safety-предела.
         """
-        start_time = time.time()
-        safe = True
-        
-        # Медленный поворот
-        ca.rotate_left(self.turn_speed)
-        self._set_movement_command("rotate_left", self.turn_speed)
+        if direction == 'left':
+            ca.rotate_left(self.turn_speed)
+            cmd = "rotate_left"
+        elif direction == 'right':
+            ca.rotate_right(self.turn_speed)
+            cmd = "rotate_right"
+        else:
+            raise ValueError(f"direction должен быть 'left'|'right', получено: {direction!r}")
+
+        self._set_movement_command(cmd, self.turn_speed)
         self.last_update_time = time.time()
 
+        start_time = time.time()
+        safe = True
         try:
             while time.time() - start_time < max_duration:
                 time.sleep(check_interval)
-                # Накапливаем угол одометрии пока крутимся
-                self._tick()
-
-                # Проверяем, не стало ли что-то слишком близко спереди
+                self._tick()  # одометрия + SLAM пока крутимся
                 distance = self.sensor_fusion.get_obstacle_distance('front')
                 if distance and distance < self.critical_distance:
                     print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
                     safe = False
                     break
-                    
         except Exception as e:
             print(f"[SAFETY] Ошибка при повороте: {e}")
             safe = False
-            
         finally:
             ca.stop_robot()
             self._set_movement_command("stop", 0)
             time.sleep(0.2)
-            
         return safe
 
-    def _safe_rotate_right(self, max_duration=1.0, check_interval=0.2):
-        """Безопасный поворот направо"""
-        start_time = time.time()
-        safe = True
-        
-        ca.rotate_right(self.turn_speed)
-        self._set_movement_command("rotate_right", self.turn_speed)
-        self.last_update_time = time.time()
+    # Совместимость со старыми вызовами — пусть остаются как тонкие алиасы.
+    def _safe_rotate_left(self, max_duration: float = 1.0, check_interval: float = 0.2) -> bool:
+        return self._safe_rotate('left', max_duration, check_interval)
 
-        try:
-            while time.time() - start_time < max_duration:
-                time.sleep(check_interval)
-                self._tick()
-
-                distance = self.sensor_fusion.get_obstacle_distance('front')
-                if distance and distance < self.critical_distance:
-                    print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
-                    safe = False
-                    break
-                    
-        except Exception as e:
-            print(f"[SAFETY] Ошибка при повороте: {e}")
-            safe = False
-            
-        finally:
-            ca.stop_robot()
-            self._set_movement_command("stop", 0)
-            time.sleep(0.2)
-            
-        return safe
+    def _safe_rotate_right(self, max_duration: float = 1.0, check_interval: float = 0.2) -> bool:
+        return self._safe_rotate('right', max_duration, check_interval)
 
     def _emergency_stop_and_back(self):
         """Экстренная остановка и отъезд назад"""

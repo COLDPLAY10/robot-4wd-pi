@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """
-Демонстрационный скрипт автономной навигации с лидаром
-Использует лидар Yahboom T-MINI Plus для построения карты и навигации
+Демонстрационный скрипт автономной навигации с лидаром.
+
+Два режима:
+  explore                        — строим карту с нуля (SLAM, scan-to-map ICP)
+  explore --map FILE.pkl         — продолжаем картировать поверх существующей карты
+  goto X Y --map FILE.pkl        — едем к точке (X, Y) по готовой карте (localization)
+
+При localization робота нужно физически поставить в точку (0, 0, 0)
+относительно карты — это начальное условие для scan matcher'а.
 """
 
-import sys
+import argparse
 import os
-import time
 import signal
+import sys
+import time
 
-# ИСПРАВЛЕНО: Добавляем путь к родительской директории
+# Импорт из родительской директории
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from map.navigation_controller import NavigationController
-import car_adapter as ca
 
 running = True
 
@@ -25,40 +32,16 @@ def signal_handler(sig, frame):
     running = False
 
 
-def exploration_with_lidar_demo():
-    """
-    Демонстрация навигации с лидаром:
-    - Робот использует лидар для построения карты
-    - Объединяет данные лидара, ультразвука и камеры
-    - Строит детальную карту окружения
-    """
-    print("\n" + "="*60)
-    print("ДЕМО: АВТОНОМНАЯ НАВИГАЦИЯ С ЛИДАРОМ")
-    print("="*60)
-    print("Робот будет исследовать окружение")
-    print("Используется: ЛИДАР + ультразвук + камера")
-    print("Нажмите Ctrl+C для остановки")
-    print("="*60 + "\n")
-
-    # Инициализация контроллера с лидаром
-    controller = NavigationController(
-        use_lidar=True,
-        use_camera=True,
-        use_ultrasonic=True
-    )
-
-    # Запуск режима исследования
-    controller.start_exploration()
-
+def _run_loop(controller: NavigationController,
+              status_interval: float,
+              stop_when_idle: bool,
+              extra_status_lines=lambda c: ()):
+    """Общий главный цикл для explore и goto."""
     last_status_time = time.time()
-    status_interval = 5.0  # Выводить статус каждые 5 секунд
-
     try:
         while running:
-            # Обновление системы навигации
             controller.update()
 
-            # Периодический вывод статуса
             current_time = time.time()
             if current_time - last_status_time >= status_interval:
                 status = controller.get_status()
@@ -66,130 +49,138 @@ def exploration_with_lidar_demo():
                 print(f"Режим: {status['mode']}")
                 pos = status['position']
                 print(f"Позиция: x={pos[0]:.2f}м, y={pos[1]:.2f}м, θ={pos[2]:.2f}рад")
-                if status['obstacle_distance'] is not None:
+                if status.get('obstacle_distance') is not None:
                     print(f"Препятствие впереди: {status['obstacle_distance']:.2f}м")
+                # Метрики scan matcher — то, ради чего весь рефакторинг
+                sm = getattr(controller.slam, 'scan_matcher', None)
+                if sm is not None:
+                    stats = sm.get_stats()
+                    print(f"Scan match: {controller.slam.scan_match_accepted}/"
+                          f"{controller.slam.scan_match_total} принято "
+                          f"(reason последнего: {stats['last_reason']}, "
+                          f"iters={stats['last_iters']})")
+                for line in extra_status_lines(controller):
+                    print(line)
                 print("-"*60)
                 last_status_time = current_time
 
-            time.sleep(0.05)  # 20 Hz
-
-    except KeyboardInterrupt:
-        print("\n[INFO] Остановка по запросу пользователя")
-    finally:
-        controller.stop()
-
-        # Сохраняем карту
-        map_file = f"map_exploration_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(map_file)
-
-        print(f"\n[INFO] Карта сохранена: {map_file}")
-        print(f"[INFO] Используйте: python3 visualize_map.py --map {map_file}")
-
-
-def goto_with_lidar_demo(target_x: float, target_y: float):
-    """
-    Демонстрация навигации к цели с лидаром
-
-    Args:
-        target_x, target_y: координаты цели в метрах
-    """
-    print("\n" + "="*60)
-    print("ДЕМО: НАВИГАЦИЯ К ЦЕЛИ С ЛИДАРОМ")
-    print("="*60)
-    print(f"Цель: ({target_x:.2f}, {target_y:.2f})")
-    print("Используется: ЛИДАР + ультразвук + камера")
-    print("Нажмите Ctrl+C для остановки")
-    print("="*60 + "\n")
-
-    # Инициализация контроллера
-    controller = NavigationController(
-        use_lidar=True,
-        use_camera=True,
-        use_ultrasonic=True
-    )
-
-    # Устанавливаем цель
-    controller.set_goal(target_x, target_y)
-
-    last_status_time = time.time()
-    status_interval = 2.0
-
-    try:
-        while running:
-            controller.update()
-
-            status = controller.get_status()
-
-            current_time = time.time()
-            if current_time - last_status_time >= status_interval:
-                print("\n" + "-"*60)
-                print(f"Режим: {status['mode']}")
-                pos = status['position']
-                print(f"Позиция: x={pos[0]:.2f}м, y={pos[1]:.2f}м")
-                print(f"Цель: x={target_x:.2f}м, y={target_y:.2f}м")
-                print(f"Waypoint: {status['waypoint']}")
-                print("-"*60)
-                last_status_time = current_time
-
-            # Проверяем, достигли ли цели
-            if status['mode'] == 'idle':
+            if stop_when_idle and controller.get_status()['mode'] == 'idle':
                 print("\n[SUCCESS] Цель достигнута!")
                 break
 
-            time.sleep(0.05)
-
+            time.sleep(0.05)  # 20 Hz
     except KeyboardInterrupt:
         print("\n[INFO] Остановка по запросу пользователя")
+
+
+def exploration_with_lidar_demo(map_file=None):
+    """
+    Режим картирования: робот исследует, scan-to-map ICP корректирует позу,
+    карта накапливается и в конце сохраняется в .pkl.
+    """
+    print("\n" + "="*60)
+    print("РЕЖИМ: КАРТИРОВАНИЕ (mapping + scan-to-map ICP)")
+    print("="*60)
+    print(f"Карта: {'продолжаем ' + map_file if map_file else 'строим с нуля'}")
+    print("Используется: ЛИДАР + scan matcher + ультразвук + камера")
+    print("Нажмите Ctrl+C для остановки и сохранения карты")
+    print("="*60 + "\n")
+
+    controller = NavigationController(
+        use_lidar=True,
+        use_camera=True,
+        use_ultrasonic=True,
+        mapping_mode='mapping',
+        map_file=map_file,
+    )
+
+    controller.start_exploration()
+
+    try:
+        _run_loop(controller, status_interval=5.0, stop_when_idle=False)
     finally:
         controller.stop()
+        out_file = f"map_exploration_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
+        controller.save_map(out_file)
+        print(f"\n[INFO] Карта сохранена: {out_file}")
+        print(f"[INFO] Запуск навигации: "
+              f"python3 demo_with_lidar.py goto X Y --map {out_file}")
 
-        # Сохраняем карту
-        map_file = f"map_navigation_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(map_file)
 
-        print(f"\n[INFO] Карта сохранена: {map_file}")
-        print(f"[INFO] Используйте: python3 visualize_map.py --map {map_file}")
+def goto_with_lidar_demo(target_x: float, target_y: float, map_file: str):
+    """
+    Режим локализации: загружаем готовую карту, scan matcher держит позу,
+    DWA ведёт к цели. Карта не модифицируется.
+    """
+    if not os.path.exists(map_file):
+        print(f"[ERROR] Карта не найдена: {map_file}")
+        sys.exit(1)
+
+    print("\n" + "="*60)
+    print("РЕЖИМ: НАВИГАЦИЯ ПО ГОТОВОЙ КАРТЕ (localization-only)")
+    print("="*60)
+    print(f"Карта: {map_file}")
+    print(f"Цель: ({target_x:.2f}, {target_y:.2f})")
+    print("ВАЖНО: поставьте робота в (0, 0, 0) карты перед запуском")
+    print("Используется: ЛИДАР + scan matcher (карта НЕ обновляется)")
+    print("Нажмите Ctrl+C для остановки")
+    print("="*60 + "\n")
+
+    controller = NavigationController(
+        use_lidar=True,
+        use_camera=True,
+        use_ultrasonic=True,
+        mapping_mode='localization',
+        map_file=map_file,
+    )
+
+    controller.set_goal(target_x, target_y)
+
+    def goal_status(c):
+        s = c.get_status()
+        return (f"Цель: x={target_x:.2f}м, y={target_y:.2f}м",
+                f"Waypoint: {s.get('waypoint')}")
+
+    try:
+        _run_loop(controller, status_interval=2.0,
+                  stop_when_idle=True,
+                  extra_status_lines=goal_status)
+    finally:
+        controller.stop()
+        # В localization режиме мы не модифицируем карту, но сохраняем pkl
+        # с обновлённой траекторией — это полезно для отчёта и отладки.
+        out_file = f"trajectory_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
+        controller.save_map(out_file)
+        print(f"\n[INFO] Траектория сохранена: {out_file}")
 
 
 def main():
-    """Главная функция"""
     signal.signal(signal.SIGINT, signal_handler)
 
-    if len(sys.argv) < 2:
-        print("Использование:")
-        print("  python3 demo_with_lidar.py explore")
-        print("  python3 demo_with_lidar.py goto X Y")
-        print()
-        print("Примеры:")
-        print("  python3 demo_with_lidar.py explore")
-        print("  python3 demo_with_lidar.py goto 2.0 1.0")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="SLAM-навигация с лидаром: картирование или езда по готовой карте",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = parser.add_subparsers(dest='cmd', required=True)
 
-    mode = sys.argv[1].lower()
+    p_explore = sub.add_parser('explore', help='построить карту окружения')
+    p_explore.add_argument('--map', dest='map_file', default=None,
+                           help='опционально: дополнить существующую карту .pkl')
 
-    if mode == "explore" or mode == "exploration":
-        exploration_with_lidar_demo()
+    p_goto = sub.add_parser('goto', help='ехать к точке по готовой карте')
+    p_goto.add_argument('x', type=float, help='X цели в метрах')
+    p_goto.add_argument('y', type=float, help='Y цели в метрах')
+    p_goto.add_argument('--map', dest='map_file', required=True,
+                        help='путь к .pkl карте (обязателен для localization)')
 
-    elif mode == "goto":
-        if len(sys.argv) < 4:
-            print("Ошибка: для режима goto требуются координаты X Y")
-            print("Использование: python3 demo_with_lidar.py goto X Y")
-            sys.exit(1)
+    args = parser.parse_args()
 
-        try:
-            target_x = float(sys.argv[2])
-            target_y = float(sys.argv[3])
-            goto_with_lidar_demo(target_x, target_y)
-        except ValueError:
-            print("Ошибка: координаты должны быть числами")
-            sys.exit(1)
-
-    else:
-        print(f"Неизвестный режим: {mode}")
-        print("Доступные режимы: explore, goto")
-        sys.exit(1)
+    if args.cmd == 'explore':
+        exploration_with_lidar_demo(map_file=args.map_file)
+    elif args.cmd == 'goto':
+        goto_with_lidar_demo(args.x, args.y, args.map_file)
 
 
 if __name__ == '__main__':
     main()
-

@@ -4,10 +4,38 @@
 Реализует A* и Dynamic Window Approach (DWA)
 """
 
-import numpy as np
-from typing import List, Tuple, Optional
+import time
 from dataclasses import dataclass
+from typing import List, Optional, Tuple
 import heapq
+
+import numpy as np
+
+# cv2.dilate — быстрый путь для inflation; на дев-машине без opencv падаем
+# на numpy-фоллбэк через итеративный 8-связный max-filter.
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except ImportError:
+    cv2 = None  # type: ignore
+    _HAS_CV2 = False
+
+
+def _binary_dilate_numpy(binary: np.ndarray, radius_px: int) -> np.ndarray:
+    """8-связное расширение бинарной маски на radius_px пикселей."""
+    out = binary.copy()
+    for _ in range(radius_px):
+        prev = out
+        out = prev.copy()
+        out[:, 1:] |= prev[:, :-1]
+        out[:, :-1] |= prev[:, 1:]
+        out[1:, :] |= prev[:-1, :]
+        out[:-1, :] |= prev[1:, :]
+        out[1:, 1:] |= prev[:-1, :-1]
+        out[1:, :-1] |= prev[:-1, 1:]
+        out[:-1, 1:] |= prev[1:, :-1]
+        out[:-1, :-1] |= prev[1:, 1:]
+    return out
 
 
 @dataclass
@@ -25,10 +53,20 @@ class PathPlanner:
     - Локальное планирование: DWA
     """
 
-    def __init__(self, occupancy_map):
+    def __init__(self, occupancy_map,
+                 robot_radius: float = 0.10,
+                 inflation_margin: float = 0.05,
+                 occupied_threshold: float = 65.0,
+                 inflation_refresh_seconds: float = 0.5):
         """
         Args:
             occupancy_map: OccupancyGrid из slam_core
+            robot_radius: радиус робота (м) — клетки в пределах этого расстояния от
+                          препятствия запрещены для A* и DWA
+            inflation_margin: дополнительный запас безопасности (м)
+            occupied_threshold: 0..100, выше — клетка считается препятствием
+                                для inflation (отделяем от threshold проверки is_occupied)
+            inflation_refresh_seconds: throttle для пересчёта inflated grid
         """
         self.map = occupancy_map
         self.current_global_path = []
@@ -47,7 +85,50 @@ class PathPlanner:
         self.clearance_weight = 0.5 # вес удаления от препятствий
         self.velocity_weight = 0.3  # вес скорости
 
-        print("[PathPlanner] Инициализирован")
+        # Inflation cost-map — расширяем препятствия на размер робота, чтобы
+        # A* не строил пути, по которым робот не пролезет геометрически.
+        self.robot_radius = robot_radius
+        self.inflation_margin = inflation_margin
+        self.occupied_threshold = occupied_threshold
+        self.inflation_refresh_seconds = inflation_refresh_seconds
+        self._inflated_grid: Optional[np.ndarray] = None
+        self._inflation_built_at: float = 0.0
+
+        print(f"[PathPlanner] Инициализирован "
+              f"(robot_radius={robot_radius:.2f}м, margin={inflation_margin:.2f}м)")
+
+    # ---------------------------------------------------------------- inflation
+
+    def _ensure_inflation(self, force: bool = False) -> None:
+        """Перестроить inflated grid из текущей карты, не чаще раза в N секунд."""
+        now = time.time()
+        if (not force) and self._inflated_grid is not None and \
+                (now - self._inflation_built_at) < self.inflation_refresh_seconds:
+            return
+
+        radius_total = self.robot_radius + self.inflation_margin
+        radius_px = max(1, int(np.ceil(radius_total / self.map.resolution)))
+
+        occupied = (self.map.grid >= self.occupied_threshold).astype(np.uint8)
+
+        if _HAS_CV2:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius_px + 1, 2 * radius_px + 1)
+            )
+            inflated = cv2.dilate(occupied, kernel)
+        else:
+            inflated = _binary_dilate_numpy(occupied.astype(bool), radius_px).astype(np.uint8)
+
+        self._inflated_grid = inflated
+        self._inflation_built_at = now
+
+    def _is_blocked(self, gx: int, gy: int) -> bool:
+        """Заблокирована ли клетка после inflation."""
+        if not (0 <= gx < self.map.width and 0 <= gy < self.map.height):
+            return True
+        return bool(self._inflated_grid[gy, gx])
+
+    # ---------------------------------------------------------------- planning
 
     def plan_global_path(self, start: Tuple[float, float],
                         goal: Tuple[float, float]) -> List[PathPoint]:
@@ -63,17 +144,22 @@ class PathPlanner:
         """
         print(f"[PathPlanner] Планирование пути: {start} -> {goal}")
 
+        # Перестраиваем inflation от текущей карты — A* поедет по нему.
+        self._ensure_inflation()
+
         # Преобразуем в координаты сетки
         start_grid = self.map.world_to_grid(start[0], start[1])
         goal_grid = self.map.world_to_grid(goal[0], goal[1])
 
-        # Проверка валидности точек
-        if not self._is_valid_grid_point(start_grid):
-            print("[PathPlanner] Стартовая точка невалидна")
+        # Стартовая точка часто оказывается "впритык" к стене после inflation —
+        # робот физически находится там, поэтому off-by-один пиксель не должен
+        # ронять планирование. Если старт в inflated-зоне, считаем его валидным.
+        if not self._is_valid_grid_point(start_grid, allow_inflated=True):
+            print("[PathPlanner] Стартовая точка невалидна (за границей карты)")
             return []
 
         if not self._is_valid_grid_point(goal_grid):
-            print("[PathPlanner] Целевая точка невалидна")
+            print("[PathPlanner] Целевая точка невалидна (в inflated-зоне или вне карты)")
             return []
 
         # A* алгоритм
@@ -111,6 +197,9 @@ class PathPlanner:
         Returns:
             (v, omega) - оптимальная линейная и угловая скорость
         """
+        # Свежий inflated grid перед оценкой траекторий
+        self._ensure_inflation()
+
         # Динамическое окно возможных скоростей
         dw = self._calculate_dynamic_window(current_vel)
 
@@ -244,33 +333,24 @@ class PathPlanner:
 
         return trajectory
 
-    def _check_collision(self, trajectory: List[Tuple[float, float, float]],
-                        safety_margin: float = 0.2) -> bool:
+    def _check_collision(self, trajectory: List[Tuple[float, float, float]]) -> bool:
         """
-        Проверка траектории на столкновения
+        Проверка траектории на столкновения через inflated grid.
 
-        Args:
-            trajectory: список точек (x, y, theta)
-            safety_margin: дополнительный отступ от препятствий
+        Размер робота уже учтён в inflation, поэтому достаточно проверить
+        попадает ли центр робота в inflated-клетку — никаких 8 точек по кругу.
 
         Returns:
             True если есть столкновение
         """
+        if self._inflated_grid is None:
+            # Дефолтный путь без inflation (на всякий случай)
+            return any(self.map.is_occupied(x, y, threshold=50) for x, y, _ in trajectory)
+
         for x, y, _ in trajectory:
-            if self.map.is_occupied(x, y, threshold=50):
+            gx, gy = self.map.world_to_grid(x, y)
+            if self._is_blocked(gx, gy):
                 return True
-
-            # Проверка вокруг точки (с учетом размера робота)
-            robot_radius = 0.15 + safety_margin
-            num_checks = 8
-            for i in range(num_checks):
-                angle = 2 * np.pi * i / num_checks
-                check_x = x + robot_radius * np.cos(angle)
-                check_y = y + robot_radius * np.sin(angle)
-
-                if self.map.is_occupied(check_x, check_y, threshold=50):
-                    return True
-
         return False
 
     def _evaluate_trajectory(self, trajectory: List[Tuple[float, float, float]],
@@ -370,15 +450,31 @@ class PathPlanner:
 
         return simplified
 
-    def _is_valid_grid_point(self, point: Tuple[int, int]) -> bool:
-        """Проверка валидности точки на сетке"""
+    def _is_valid_grid_point(self, point: Tuple[int, int],
+                             allow_inflated: bool = False) -> bool:
+        """
+        Проверка валидности точки на сетке.
+
+        Args:
+            point: (gx, gy) в координатах сетки
+            allow_inflated: если True, разрешаем inflated-зону (для стартовой
+                            позиции робота — он уже в этой клетке физически)
+        """
         gx, gy = point
 
         if not (0 <= gx < self.map.width and 0 <= gy < self.map.height):
             return False
 
-        # Проверка на занятость (с небольшим порогом)
-        return self.map.grid[gy, gx] < 70
+        if allow_inflated:
+            # Только защита от настоящих препятствий, без расширения
+            return self.map.grid[gy, gx] < 70
+
+        # Полный inflated test — после _ensure_inflation()
+        if self._inflated_grid is None:
+            # До первого _ensure_inflation падаем на старый поведение,
+            # чтобы тесты вне планировщика работали как раньше.
+            return self.map.grid[gy, gx] < 70
+        return not bool(self._inflated_grid[gy, gx])
 
     @staticmethod
     def _point_to_line_distance(point, line_start, line_end):
