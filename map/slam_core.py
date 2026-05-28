@@ -126,7 +126,7 @@ class SLAM:
 
     def __init__(self, map_width=400, map_height=400, resolution=0.05,
                  use_lidar=True, mapping_mode='mapping',
-                 enable_scan_matching=True):
+                 enable_scan_matching=True, wheel_base=0.097):
         """
         Args:
             map_width: ширина карты в ячейках
@@ -136,6 +136,11 @@ class SLAM:
             mapping_mode: 'mapping' | 'localization' — см. docstring класса
             enable_scan_matching: подключать ли scan matcher (для дебага можно
                                   выключить и работать только по одометрии)
+            wheel_base: расстояние между центрами левых и правых колёс (м).
+                        ОБЯЗАТЕЛЬНО должен совпадать с тем, что использует
+                        NavigationController при расчёте left/right_speed,
+                        иначе omega восстанавливается с ошибкой и scan matcher
+                        не сходится.
         """
         if mapping_mode not in ('mapping', 'localization'):
             raise ValueError(f"mapping_mode должен быть 'mapping' или 'localization', "
@@ -143,6 +148,7 @@ class SLAM:
 
         self.use_lidar = use_lidar
         self.mapping_mode = mapping_mode
+        self.wheel_base = float(wheel_base)
         self.map = OccupancyGrid(map_width, map_height, resolution)
 
         # Scan matcher подключаем только если есть лидар: без сканов он бесполезен.
@@ -201,11 +207,11 @@ class SLAM:
             right_speed: скорость правых колес (м/с)
             dt: временной интервал (сек)
         """
-        wheel_base = 0.15  # TODO расстояние между колесами в метрах
-
-        # Линейная и угловая скорость
+        # Линейная и угловая скорость (диф-drive модель).
+        # self.wheel_base ОБЯЗАН совпадать с тем, что использует контроллер
+        # при формировании left/right_speed — иначе omega приходит с ошибкой.
         v = (left_speed + right_speed) / 2.0
-        omega = (right_speed - left_speed) / wheel_base
+        omega = (right_speed - left_speed) / self.wheel_base
 
         # Обновление позиции
         self.current_position.x += v * np.cos(self.current_position.theta) * dt

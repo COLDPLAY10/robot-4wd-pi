@@ -37,7 +37,7 @@ class DepthEstimator:
     """
 
     def __init__(self,
-                 model_path: str = 'models/depth_anything_v2_small.onnx',
+                 model_path: Optional[str] = None,
                  input_size: int = DEFAULT_INPUT_SIZE,
                  num_threads: int = 2,
                  max_depth_m: float = 10.0):
@@ -49,6 +49,13 @@ class DepthEstimator:
                          больше — конкурирует со SLAM и DWA.
             max_depth_m: всё что дальше — игнорируем (модель экстраполирует плохо)
         """
+        # Дефолт — абсолютный путь относительно репо (camera_perception/../models/).
+        # Иначе CWD-зависимый относительный путь ломается при запуске из map_scripts/.
+        if model_path is None:
+            model_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                'models', 'depth_anything_v2_small.onnx',
+            )
         self.model_path = model_path
         self.input_size = input_size
         self.num_threads = num_threads

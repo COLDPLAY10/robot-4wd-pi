@@ -57,13 +57,16 @@ class NavigationController:
         self.use_ultrasonic = use_ultrasonic
         self.mapping_mode = mapping_mode
 
-        # Инициализация компонентов
+        # Инициализация компонентов.
+        # WHEEL_BASE прокидываем в SLAM явно — single source of truth, иначе
+        # omega восстанавливается с ошибкой 35-50% и scan matcher не сходится.
         self.slam = SLAM(
             map_width=400,
             map_height=400,
             resolution=0.05,
             use_lidar=use_lidar,
             mapping_mode=mapping_mode,
+            wheel_base=self.WHEEL_BASE,
         )
 
         # Загрузка карты — в localization обязательно, в mapping опционально
@@ -79,7 +82,13 @@ class NavigationController:
             use_ultrasonic=use_ultrasonic
         )
 
-        self.path_planner = PathPlanner(self.slam.map)
+        # ROBOT_RADIUS/SAFETY_MARGIN — single source of truth, чтобы inflation
+        # в карте соответствовал реальному footprint тележки.
+        self.path_planner = PathPlanner(
+            self.slam.map,
+            robot_radius=self.ROBOT_RADIUS,
+            inflation_margin=self.SAFETY_MARGIN,
+        )
 
         # Режим работы
         self.mode = NavigationMode.IDLE
@@ -138,7 +147,12 @@ class NavigationController:
     CAMERA_MOUNT_TILT_RAD = 0.0    # 0 = горизонтально, >0 = смотрит вниз
     CAMERA_PIXEL_STRIDE = 8        # обрабатывать каждый 8-й пиксель
     CAMERA_MAX_RANGE_M = 2.5       # дальше глубина модели становится ненадёжной
-    DEPTH_MODEL_PATH = 'models/depth_anything_v2_small.onnx'
+    # Путь к модели абсолютный — относительный (CWD-зависимый) сломается,
+    # если запускать demo_with_lidar.py из map_scripts/, из других папок и т.п.
+    DEPTH_MODEL_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'models', 'depth_anything_v2_small.onnx',
+    )
 
     def _init_depth_perception(self):
         """Инициализация камеры + модели глубины при первом обращении."""
@@ -263,6 +277,22 @@ class NavigationController:
         elif self.mode == NavigationMode.OBSTACLE_AVOIDANCE:
             self._safe_avoidance_behavior()
 
+    # Минимум секунд между повторными логами одной и той же ошибки сенсора.
+    # _update_sensors зовётся 20Hz, без throttle лог будет залит однотипными
+    # исключениями. С throttle ошибка видна, но не топит полезные сообщения.
+    _SENSOR_ERROR_LOG_INTERVAL_S = 2.0
+
+    def _log_sensor_error(self, sensor: str, exc: Exception) -> None:
+        """Залогировать ошибку сенсора с throttle (не чаще раза в N секунд)."""
+        if not hasattr(self, '_last_sensor_error'):
+            self._last_sensor_error = {}
+        now = time.time()
+        last = self._last_sensor_error.get(sensor, 0.0)
+        if now - last >= self._SENSOR_ERROR_LOG_INTERVAL_S:
+            self._last_sensor_error[sensor] = now
+            print(f"[NavController] Ошибка сенсора '{sensor}': "
+                  f"{type(exc).__name__}: {exc}")
+
     def _update_sensors(self):
         """Обновление данных сенсоров"""
 
@@ -276,7 +306,7 @@ class NavigationController:
                     self.sensor_fusion.update_ultrasonic(distance_m)
                     self.slam.update_with_ultrasonic(distance_m)
             except Exception as e:
-                pass  # Игнорируем ошибки чтения
+                self._log_sensor_error('ultrasonic', e)
 
         # Лидар
         if self.use_lidar and self.lidar is not None:
@@ -289,7 +319,7 @@ class NavigationController:
                         self.sensor_fusion.update_lidar(filtered_scan)
                         self.slam.update_with_lidar(filtered_scan)
             except Exception as e:
-                pass  # Игнорируем ошибки чтения лидара
+                self._log_sensor_error('lidar', e)
 
         # Камера: Depth-Anything-V2 → обратная проекция → occupancy grid.
         # Сегментация "пол/стены" удалена как нерабочая на 46-кадровом датасете.
@@ -310,7 +340,7 @@ class NavigationController:
                                 max_range_m=self.CAMERA_MAX_RANGE_M,
                             )
             except Exception as e:
-                pass  # Игнорируем ошибки камеры
+                self._log_sensor_error('camera', e)
 
     # ===== Калибровка одометрии =====
     # Платформа: Yahboom Raspbot V2 (мекалум-4WD, TT-моторы без энкодеров/PID).
@@ -321,7 +351,16 @@ class NavigationController:
     PWM_FULL = 255.0
     MAX_LINEAR_SPEED = 0.6     # м/с при PWM=255, диапазон ~0.5..0.7 (ровный пол)
     MAX_ANGULAR_SPEED = 6.0    # рад/с при PWM=255 (~1 оборот/сек), диапазон ~5..8
-    WHEEL_BASE = 0.097         # м, для diff-drive интерфейса в SLAM — измерить штангенциркулем
+    # Расстояние между центрами левых/правых колёс — измерить штангенциркулем.
+    # ВАЖНО: это же значение передаётся в SLAM при инициализации, иначе omega
+    # восстанавливается с ошибкой и scan matcher не сходится.
+    WHEEL_BASE = 0.097
+    # Радиус робота для inflation cost-map: реальный bounding circle с торчащими
+    # колёсами ~0.12м + margin 0.08м = итого 20см запретной зоны вокруг препятствий.
+    # На защите легко показать: чем толще красный пояс на PNG карты, тем безопаснее
+    # построенный путь, но и больше шанс "узких" коридоров стать непроходимыми.
+    ROBOT_RADIUS = 0.12
+    SAFETY_MARGIN = 0.08
 
     def _update_odometry(self, dt: float):
         """
@@ -854,14 +893,19 @@ class NavigationController:
                 pass
 
     def save_map(self, filename: str):
-        """Сохранение карты"""
-        self.slam.save_map(filename)
+        """Сохранение карты — inflation на PNG показываем тем же радиусом, который A* использует на самом деле."""
+        self.slam.save_map(filename,
+                           inflation_radius_m=self.ROBOT_RADIUS + self.SAFETY_MARGIN)
 
     def load_map(self, filename: str):
         """Загрузка карты"""
         self.slam.load_map(filename)
-        # Обновляем планировщик
-        self.path_planner = PathPlanner(self.slam.map)
+        # Обновляем планировщик с теми же footprint-параметрами, что и при __init__
+        self.path_planner = PathPlanner(
+            self.slam.map,
+            robot_radius=self.ROBOT_RADIUS,
+            inflation_margin=self.SAFETY_MARGIN,
+        )
 
     def get_status(self) -> dict:
         """Получение статуса системы"""
