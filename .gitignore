@@ -42,6 +42,12 @@ models/*.pb
 map_*.pkl
 map_autosave_*.pkl
 
+# Сгенерированные изображения карт/траекторий
+slam_map.png
+map_*.png
+map_scripts/map_*.png
+*_trajectory*.png
+
 # Логи
 *.log
 
