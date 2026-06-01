@@ -13,6 +13,8 @@ from .projection import (
     CameraIntrinsics,
     CameraMount,
     backproject_depth_to_world,
+    filter_obstacles_by_height,
+    obstacle_distances_by_sector,
 )
 
 __all__ = [
@@ -20,4 +22,6 @@ __all__ = [
     'CameraIntrinsics',
     'CameraMount',
     'backproject_depth_to_world',
+    'filter_obstacles_by_height',
+    'obstacle_distances_by_sector',
 ]

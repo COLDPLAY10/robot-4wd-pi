@@ -155,3 +155,65 @@ def filter_obstacles_by_height(
     z = world_points[:, 2]
     mask = (z >= min_height_m) & (z <= max_height_m)
     return world_points[mask]
+
+
+def obstacle_distances_by_sector(
+    obstacles_world: np.ndarray,
+    robot_pose: tuple,
+    front_halfwidth_rad: float = np.pi / 6,   # ±30°, как сектор front у лидара
+    side_max_rad: float = np.pi / 2,          # боковые секторы до ±90°
+    min_range_m: float = 0.12,                # шумовой порог (само-обзор/артефакты)
+    max_range_m: float = 2.5,
+    min_points: int = 3,
+    near_percentile: float = 15.0,
+) -> dict:
+    """
+    Оценить расстояние до ближайшего препятствия в секторах front/left/right
+    по облаку препятствий (мировые координаты, уже отфильтрованных по высоте).
+
+    Предназначено для реактивного слоя (sensor_fusion), а не для карты. Секторы
+    заданы относительно текущего курса робота, как у лидара: front — это ±30°.
+
+    ВАЖНО: горизонтальный FOV камеры ~60° (±30°), поэтому реально заполняется
+    почти только сектор front. Боковые секторы клиппируются краем кадра и обычно
+    пусты — это ожидаемо, а не ошибка.
+
+    Робастная оценка ближнего препятствия — перцентиль near_percentile по
+    дальностям точек сектора: защищает от одиночных выбросов глубины (которые
+    иначе вызывали бы ложную экстренную остановку). Требуется минимум
+    min_points точек, иначе сектор считается пустым (None).
+
+    Args:
+        obstacles_world: N×3 (x, y, z) в мировой системе, уже по высоте.
+        robot_pose: (x, y, theta) робота в мировой системе.
+
+    Returns:
+        {'front': dist|None, 'left': dist|None, 'right': dist|None}
+    """
+    result = {'front': None, 'left': None, 'right': None}
+    if obstacles_world is None or len(obstacles_world) == 0:
+        return result
+
+    rx, ry, rtheta = robot_pose
+    dx = obstacles_world[:, 0] - rx
+    dy = obstacles_world[:, 1] - ry
+    ranges = np.hypot(dx, dy)
+
+    # Пеленг относительно курса робота: 0 — прямо по курсу, + — влево.
+    bearings = np.arctan2(dy, dx) - rtheta
+    bearings = (bearings + np.pi) % (2 * np.pi) - np.pi  # нормализация в [-pi, pi]
+
+    valid = (ranges >= min_range_m) & (ranges <= max_range_m)
+
+    sectors = {
+        'front': np.abs(bearings) <= front_halfwidth_rad,
+        'left':  (bearings > front_halfwidth_rad) & (bearings <= side_max_rad),
+        'right': (bearings < -front_halfwidth_rad) & (bearings >= -side_max_rad),
+    }
+
+    for name, sec_mask in sectors.items():
+        sel = ranges[valid & sec_mask]
+        if sel.size >= min_points:
+            result[name] = float(np.percentile(sel, near_percentile))
+
+    return result

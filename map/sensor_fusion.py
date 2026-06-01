@@ -79,19 +79,26 @@ class SensorFusion:
         )
         self.last_lidar_update = time.time()
 
-    def update_camera(self, segmentation_mask):
+    def update_camera(self, obstacle_distances):
         """
-        Обновление данных камеры
+        Обновление данных камеры (depth) для реактивного слоя.
 
         Args:
-            segmentation_mask: маска сегментации (numpy array)
+            obstacle_distances: словарь секторных расстояний до ближайшего
+                препятствия, например {'front': 0.42, 'left': None, 'right': None}.
+                Получается из карты глубины через
+                camera_perception.obstacle_distances_by_sector.
+
+        Примечание: раньше сюда подавалась маска сегментации «пол/стены».
+        Тот подход (camera_segmentation/) удалён; камера теперь даёт метрическую
+        глубину, поэтому реактивный слой работает с готовыми расстояниями.
         """
         if not self.use_camera:
             return
 
         self.camera_data = SensorData(
             sensor_type='camera',
-            data=segmentation_mask,
+            data=obstacle_distances or {},
             confidence=0.7,
             timestamp=time.time()
         )
@@ -126,62 +133,44 @@ class SensorFusion:
             расстояние в метрах или None
         """
         current_time = time.time()
-        distances = []
 
-        # Проверяем лидар (наивысший приоритет)
-        if self.use_lidar and self.lidar_data is not None:
-            if current_time - self.last_lidar_update < self.data_timeout:
-                # Извлекаем минимальное расстояние из сканов лидара
-                min_dist = self._extract_lidar_distance(self.lidar_data.data, direction)
-                if min_dist is not None:
-                    distances.append((min_dist, self.sensor_priority['lidar']))
-
-        # Проверяем ультразвук
-        if self.use_ultrasonic and self.ultrasonic_data is not None:
-            if current_time - self.last_ultrasonic_update < self.data_timeout:
-                if direction == 'front':  # ультразвук обычно смотрит вперед
-                    dist = self.ultrasonic_data.data
-                    if dist > 0 and dist < 4.0:
-                        distances.append((dist, self.sensor_priority['ultrasonic']))
-
-        # Проверяем камеру
-        if self.use_camera and self.camera_data is not None:
-            if current_time - self.last_camera_update < self.data_timeout:
-                # Оценка расстояния по сегментации
-                dist = self._estimate_distance_from_segmentation(
-                    self.camera_data.data, direction
-                )
-                if dist is not None:
-                    distances.append((dist, self.sensor_priority['camera']))
-
-        # Выбираем итоговое расстояние с учётом кросс-валидации датчиков
-        if not distances:
-            return None
-
-        # Сортируем по приоритету (убывание)
-        distances.sort(key=lambda x: x[1], reverse=True)
-
-        # Кросс-валидация: если лидар говорит "очень близко", но ультразвук
-        # показывает "свободно" — лидар шумит, доверяем ультразвуку
+        # --- Лидар: основной дальномер ---
         lidar_dist = None
+        if (self.use_lidar and self.lidar_data is not None
+                and current_time - self.last_lidar_update < self.data_timeout):
+            lidar_dist = self._extract_lidar_distance(self.lidar_data.data, direction)
+
+        # --- Ультразвук: только вперёд ---
         ultrasonic_dist = None
-        for d, p in distances:
-            if p == self.sensor_priority['lidar']:
-                lidar_dist = d
-            if p == self.sensor_priority['ultrasonic']:
-                ultrasonic_dist = d
+        if (self.use_ultrasonic and self.ultrasonic_data is not None
+                and current_time - self.last_ultrasonic_update < self.data_timeout
+                and direction == 'front'):
+            dist = self.ultrasonic_data.data
+            if 0.0 < dist < 4.0:
+                ultrasonic_dist = dist
 
-        if lidar_dist is not None and ultrasonic_dist is not None:
-            # Если лидар говорит < 20 см, а ультразвук > 40 см — явное противоречие
-            if lidar_dist < 0.20 and ultrasonic_dist > 0.40:
-                print(f"[SensorFusion] ⚠️ Конфликт: лидар={lidar_dist:.2f}м, ультразвук={ultrasonic_dist:.2f}м → доверяем ультразвуку")
-                return ultrasonic_dist
-            # Если оба примерно согласны (разница < 2x), берём средневзвешенное
-            # Лидар точнее, но ультразвук надёжнее вблизи
-            return lidar_dist * 0.6 + ultrasonic_dist * 0.4
+        # Базовая оценка по «надёжным» дальномерам (лидар + ультразвук).
+        base = self._combine_range_sensors(lidar_dist, ultrasonic_dist)
 
-        # Если только один датчик — используем его
-        return distances[0][0]
+        # --- Камера (depth): секторные расстояния из карты глубины ---
+        camera_dist = None
+        if (self.use_camera and self.camera_data is not None
+                and current_time - self.last_camera_update < self.data_timeout):
+            camera_dist = self.camera_data.data.get(direction)
+
+        # Слияние камеры с базовой оценкой.
+        # Принцип безопасности: камера может только СОКРАТИТЬ расстояние (сделать
+        # поведение осторожнее), но никогда не объявляет «свободно» в обход лидара.
+        if direction == 'front':
+            # Фронт: камера в полном доверии — берём минимум. Камера-глубина
+            # видит низкие препятствия, которые 2D-лидар на своей высоте пропускает.
+            return self._min_ignore_none(base, camera_dist)
+
+        # Бока: камера слабая (горизонтальный FOV ~60°, край кадра шумит) —
+        # используем её только как gap-fill там, где у лидара нет данных.
+        if base is not None:
+            return base
+        return camera_dist
 
     def is_obstacle_detected(self, min_distance: float = 0.3) -> bool:
         """
@@ -301,31 +290,31 @@ class SensorFusion:
 
         return median_dist
 
-    def _estimate_distance_from_segmentation(self, mask, direction: str) -> Optional[float]:
-        """Оценка расстояния на основе сегментации"""
-        if mask is None or mask.size == 0:
-            return None
+    @staticmethod
+    def _combine_range_sensors(lidar_dist: Optional[float],
+                               ultrasonic_dist: Optional[float]) -> Optional[float]:
+        """
+        Кросс-валидация лидара и ультразвука — двух «надёжных» дальномеров.
+        Лидар основной; ультразвук уточняет вблизи и страхует от шума лидара.
+        """
+        if lidar_dist is not None and ultrasonic_dist is not None:
+            # Лидар говорит «очень близко», а ультразвук «свободно» — лидар
+            # шумит, доверяем ультразвуку.
+            if lidar_dist < 0.20 and ultrasonic_dist > 0.40:
+                print(f"[SensorFusion] ⚠️ Конфликт: лидар={lidar_dist:.2f}м, "
+                      f"ультразвук={ultrasonic_dist:.2f}м → доверяем ультразвуку")
+                return ultrasonic_dist
+            # Оба примерно согласны — средневзвешенное (лидар точнее).
+            return lidar_dist * 0.6 + ultrasonic_dist * 0.4
+        if lidar_dist is not None:
+            return lidar_dist
+        return ultrasonic_dist
 
-        h, w = mask.shape
-
-        # Определяем область интереса для направления
-        if direction == 'front':
-            roi = mask[h//2:h, w//3:2*w//3]
-        elif direction == 'left':
-            roi = mask[h//2:h, 0:w//3]
-        elif direction == 'right':
-            roi = mask[h//2:h, 2*w//3:w]
-        else:
-            return None
-
-        # Ищем первое препятствие (снизу вверх)
-        for row in range(roi.shape[0] - 1, -1, -1):
-            if np.any((roi[row] > 0) & (roi[row] != 10)):  # не unknown(0) и не floor(10)
-                # Оценка расстояния по вертикальной позиции
-                distance = 3.0 * (1.0 - (roi.shape[0] - row) / roi.shape[0])
-                return max(0.2, distance)
-
-        return None
+    @staticmethod
+    def _min_ignore_none(*values) -> Optional[float]:
+        """Минимум из переданных значений, игнорируя None. None — если все None."""
+        present = [v for v in values if v is not None]
+        return min(present) if present else None
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:

@@ -391,10 +391,8 @@ class SLAM:
             min/max_obstacle_height_m: диапазон высот, классифицируемых как препятствие
             max_range_m: дальше — игнорируем (модель экстраполирует плохо)
         """
-        if self.mapping_mode != 'mapping':
-            return  # в localization-режиме карта read-only
         if depth_map is None or depth_map.size == 0:
-            return
+            return np.zeros((0, 3), dtype=np.float32)
 
         # Ленивый импорт — slam_core не должен жёстко тянуть camera_perception
         from camera_perception.projection import (backproject_depth_to_world,
@@ -416,27 +414,33 @@ class SLAM:
                                                min_height_m=min_obstacle_height_m,
                                                max_height_m=max_obstacle_height_m)
 
-        # 1. Препятствия: пишем точку как occupied
-        for ox, oy, _oz in obstacles:
-            self.map.update_cell(float(ox), float(oy),
-                                 occupied=True, confidence=0.7)
+        # Запись в карту — только в режиме построения; в localization карта
+        # read-only. Облако препятствий при этом возвращается ВСЕГДА: оно нужно
+        # реактивному слою (sensor_fusion) и в режиме навигации к цели тоже.
+        if self.mapping_mode == 'mapping':
+            # 1. Препятствия: пишем точку как occupied
+            for ox, oy, _oz in obstacles:
+                self.map.update_cell(float(ox), float(oy),
+                                     occupied=True, confidence=0.7)
 
-        # 2. Свободное пространство по лучу от робота к каждой точке глубины
-        #    (НЕ только препятствие — любая depth-точка значит "до неё пусто").
-        #    Чтобы не записывать слишком много клеток, берём подвыборку лучей.
-        ray_stride = max(1, pixel_stride * 2)
-        ray_points = points[::ray_stride] if len(points) > 0 else points
-        for tx, ty, _tz in ray_points:
-            dist = float(np.hypot(tx - robot_x, ty - robot_y))
-            if dist < self.map.resolution:
-                continue
-            num_steps = max(2, int(dist / (self.map.resolution * 2)))
-            for i in range(1, num_steps):
-                t = i / num_steps
-                free_x = robot_x + t * (tx - robot_x)
-                free_y = robot_y + t * (ty - robot_y)
-                self.map.update_cell(free_x, free_y,
-                                     occupied=False, confidence=0.3)
+            # 2. Свободное пространство по лучу от робота к каждой точке глубины
+            #    (НЕ только препятствие — любая depth-точка значит "до неё пусто").
+            #    Чтобы не записывать слишком много клеток, берём подвыборку лучей.
+            ray_stride = max(1, pixel_stride * 2)
+            ray_points = points[::ray_stride] if len(points) > 0 else points
+            for tx, ty, _tz in ray_points:
+                dist = float(np.hypot(tx - robot_x, ty - robot_y))
+                if dist < self.map.resolution:
+                    continue
+                num_steps = max(2, int(dist / (self.map.resolution * 2)))
+                for i in range(1, num_steps):
+                    t = i / num_steps
+                    free_x = robot_x + t * (tx - robot_x)
+                    free_y = robot_y + t * (ty - robot_y)
+                    self.map.update_cell(free_x, free_y,
+                                         occupied=False, confidence=0.3)
+
+        return obstacles
 
     def update_with_camera_segmentation(self, segmentation_mask: np.ndarray,
                                        camera_fov: float = 60.0,

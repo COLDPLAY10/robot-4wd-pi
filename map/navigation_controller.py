@@ -147,6 +147,14 @@ class NavigationController:
     CAMERA_MOUNT_TILT_RAD = 0.0    # 0 = горизонтально, >0 = смотрит вниз
     CAMERA_PIXEL_STRIDE = 8        # обрабатывать каждый 8-й пиксель
     CAMERA_MAX_RANGE_M = 2.5       # дальше глубина модели становится ненадёжной
+    # --- Реактивный слой камеры (depth → объезд препятствий) ---
+    # Камера-глубина видит низкие препятствия, которые 2D-лидар на своей высоте
+    # пропускает. ВКЛЮЧЕНО консервативно: камера может только сделать поведение
+    # осторожнее (фронт — min с лидаром), но не объявляет «свободно» в обход
+    # лидара. Монокулярная глубина шумит и «плавает» по масштабу — если в поле
+    # пойдут ложные стопы, выставить CAMERA_REACTIVE_ENABLED=False без правки кода.
+    CAMERA_REACTIVE_ENABLED = True
+    CAMERA_REACTIVE_MIN_RANGE_M = 0.12  # шумовой порог: ближе игнорируем (артефакты)
     # Путь к модели абсолютный — относительный (CWD-зависимый) сломается,
     # если запускать demo_with_lidar.py из map_scripts/, из других папок и т.п.
     DEPTH_MODEL_PATH = os.path.join(
@@ -334,11 +342,27 @@ class NavigationController:
                     if ret and frame is not None:
                         depth = self.depth_estimator.get_depth_map(frame)
                         if depth is not None:
-                            self.slam.update_with_camera_depth(
+                            # update_with_camera_depth пишет в карту (только в
+                            # mapping) и ВОЗВРАЩАЕТ облако препятствий по высоте —
+                            # доступно и в localization, без повторного бэкпроджекта.
+                            obstacles = self.slam.update_with_camera_depth(
                                 depth, self.camera_intrinsics, self.camera_mount,
                                 pixel_stride=self.CAMERA_PIXEL_STRIDE,
                                 max_range_m=self.CAMERA_MAX_RANGE_M,
                             )
+                            # Реактивный слой: секторные расстояния из того же
+                            # облака → в sensor_fusion (фронт сильный, бока gap-fill).
+                            if self.CAMERA_REACTIVE_ENABLED:
+                                from camera_perception import obstacle_distances_by_sector
+                                pose = (self.slam.current_position.x,
+                                        self.slam.current_position.y,
+                                        self.slam.current_position.theta)
+                                cam_dists = obstacle_distances_by_sector(
+                                    obstacles, pose,
+                                    min_range_m=self.CAMERA_REACTIVE_MIN_RANGE_M,
+                                    max_range_m=self.CAMERA_MAX_RANGE_M,
+                                )
+                                self.sensor_fusion.update_camera(cam_dists)
             except Exception as e:
                 self._log_sensor_error('camera', e)
 
