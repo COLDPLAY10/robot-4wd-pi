@@ -136,11 +136,12 @@ class SLAM:
             mapping_mode: 'mapping' | 'localization' — см. docstring класса
             enable_scan_matching: подключать ли scan matcher (для дебага можно
                                   выключить и работать только по одометрии)
-            wheel_base: расстояние между центрами левых и правых колёс (м).
-                        ОБЯЗАТЕЛЬНО должен совпадать с тем, что использует
-                        NavigationController при расчёте left/right_speed,
-                        иначе omega восстанавливается с ошибкой и scan matcher
-                        не сходится.
+            wheel_base: эффективная база диф-модели (м). Для мекалум-шасси это
+                        сумма колеи и межосевого расстояния (см. WHEEL_BASE в
+                        NavigationController). ОБЯЗАТЕЛЬНО должна совпадать с
+                        тем, что использует NavigationController при расчёте
+                        left/right_speed, иначе omega восстанавливается с
+                        ошибкой и scan matcher не сходится.
         """
         if mapping_mode not in ('mapping', 'localization'):
             raise ValueError(f"mapping_mode должен быть 'mapping' или 'localization', "
@@ -372,7 +373,8 @@ class SLAM:
                                  pixel_stride: int = 8,
                                  min_obstacle_height_m: float = 0.03,
                                  max_obstacle_height_m: float = 0.50,
-                                 max_range_m: float = 2.5):
+                                 max_range_m: float = 6.0,
+                                 map_write_max_range_m: Optional[float] = None):
         """
         Обновление карты препятствий из карты глубины (Depth-Anything-V2).
 
@@ -389,7 +391,12 @@ class SLAM:
             mount: CameraMount из camera_perception
             pixel_stride: брать каждый N-й пиксель (компромисс точность/скорость)
             min/max_obstacle_height_m: диапазон высот, классифицируемых как препятствие
-            max_range_m: дальше — игнорируем (модель экстраполирует плохо)
+            max_range_m: предел анализа сцены — возвращаемое облако препятствий
+                         (реактивный слой, выбор направления) считается до него
+            map_write_max_range_m: предел ЗАПИСИ В КАРТУ; None = max_range_m.
+                         Монокулярная глубина с дистанцией шумит всё сильнее,
+                         а occupied-ячейка (conf 0.7) сразу блокирует A* —
+                         поэтому в карту пишем консервативнее, чем анализируем.
         """
         if depth_map is None or depth_map.size == 0:
             return np.zeros((0, 3), dtype=np.float32)
@@ -418,16 +425,33 @@ class SLAM:
         # read-only. Облако препятствий при этом возвращается ВСЕГДА: оно нужно
         # реактивному слою (sensor_fusion) и в режиме навигации к цели тоже.
         if self.mapping_mode == 'mapping':
-            # 1. Препятствия: пишем точку как occupied
-            for ox, oy, _oz in obstacles:
+            map_cap = (map_write_max_range_m if map_write_max_range_m is not None
+                       else max_range_m)
+
+            # 1. Препятствия: пишем точку как occupied — но только ближние,
+            #    дальняя монокулярная глубина слишком шумная для карты.
+            if len(obstacles) > 0:
+                obs_dist = np.hypot(obstacles[:, 0] - robot_x,
+                                    obstacles[:, 1] - robot_y)
+                near_obstacles = obstacles[obs_dist <= map_cap]
+            else:
+                near_obstacles = obstacles
+            for ox, oy, _oz in near_obstacles:
                 self.map.update_cell(float(ox), float(oy),
                                      occupied=True, confidence=0.7)
 
             # 2. Свободное пространство по лучу от робота к каждой точке глубины
             #    (НЕ только препятствие — любая depth-точка значит "до неё пусто").
-            #    Чтобы не записывать слишком много клеток, берём подвыборку лучей.
+            #    Лучи — тоже только в пределах map_cap, и с подвыборкой,
+            #    чтобы не записывать слишком много клеток.
+            if len(points) > 0:
+                pts_dist = np.hypot(points[:, 0] - robot_x,
+                                    points[:, 1] - robot_y)
+                ray_candidates = points[pts_dist <= map_cap]
+            else:
+                ray_candidates = points
             ray_stride = max(1, pixel_stride * 2)
-            ray_points = points[::ray_stride] if len(points) > 0 else points
+            ray_points = ray_candidates[::ray_stride]
             for tx, ty, _tz in ray_points:
                 dist = float(np.hypot(tx - robot_x, ty - robot_y))
                 if dist < self.map.resolution:

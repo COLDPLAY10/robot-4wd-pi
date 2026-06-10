@@ -77,13 +77,16 @@ def set_backlight_rgb(rgb):
     return False
 
 def turn_off_backlight():
+    # ВАЖНО: здесь НЕ трогаем ультразвук. Раньше список содержал
+    # ('Ctrl_Ulatist_Switch', (0,)), из-за чего гашение RGB-подсветки
+    # попутно ВЫКЛЮЧАЛО ультразвуковой датчик (та же I2C-плата 0x2B).
+    # Подсветка и дальномер — независимые функции, разделяем их.
     calls = [
         ('Ctrl_WQ2812_brightness_ALL', (0, 0, 0)),
         ('Ctrl_WQ2812_Alone', (0, 0, 0)),
         ('Ctrl_WQ2812_ALL', (0, 0)),
         ('write_u8', (5, 0)),
         ('write_u8', (4, 0)),
-        ('Ctrl_Ulatist_Switch', (0,))
     ]
     for name, args in calls:
         ok, info = safe_call(name, *args)

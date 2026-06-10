@@ -12,6 +12,7 @@ Pipeline:
 """
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -63,7 +64,8 @@ def backproject_depth_to_world(
     min_depth_m: float = 0.15,
     max_depth_m: float = 3.0,
     use_lower_half_only: bool = True,
-) -> np.ndarray:
+    return_pixels: bool = False,
+):
     """
     Спроецировать пиксели depth-карты в мировые координаты.
 
@@ -76,10 +78,14 @@ def backproject_depth_to_world(
         min_depth_m, max_depth_m: фильтр валидных глубин
         use_lower_half_only: брать только нижнюю половину кадра (стол, пол, ножки)
                             — там реально лежат препятствия, верх кадра это потолок/далёкие стены
+        return_pixels: вернуть также пиксельные координаты точек — нужно
+                       отладочной визуализации, чтобы подсветить на кадре
+                       пиксели, ставшие препятствиями
 
     Returns:
-        N×3 float32 массив (x_world, y_world, z_world).
-        Пустой массив shape (0, 3) если ничего не спроецировалось.
+        N×3 float32 массив (x_world, y_world, z_world);
+        при return_pixels=True — кортеж (points N×3, pixels N×2 int32 (u, v)).
+        Пустые массивы, если ничего не спроецировалось.
     """
     h, w = depth_map.shape
     rx, ry, rtheta = robot_pose
@@ -100,7 +106,10 @@ def backproject_depth_to_world(
     # Фильтр валидных глубин
     valid = (z_cam >= min_depth_m) & (z_cam <= max_depth_m)
     if not valid.any():
-        return np.zeros((0, 3), dtype=np.float32)
+        empty = np.zeros((0, 3), dtype=np.float32)
+        if return_pixels:
+            return empty, np.zeros((0, 2), dtype=np.int32)
+        return empty
     uu = uu[valid]; vv = vv[valid]; z_cam = z_cam[valid]
 
     # Pinhole back-projection:
@@ -132,14 +141,18 @@ def backproject_depth_to_world(
     y_w = ry + sin_th * x_r + cos_th * y_r
     z_w = z_r  # робот ездит по плоскому полу, мировой z = роботовский z
 
-    return np.column_stack([x_w, y_w, z_w]).astype(np.float32)
+    points = np.column_stack([x_w, y_w, z_w]).astype(np.float32)
+    if return_pixels:
+        return points, np.column_stack([uu, vv]).astype(np.int32)
+    return points
 
 
 def filter_obstacles_by_height(
     world_points: np.ndarray,
     min_height_m: float = 0.03,
     max_height_m: float = 0.50,
-) -> np.ndarray:
+    return_mask: bool = False,
+):
     """
     Отфильтровать точки по высоте над полом — это и есть "препятствия для тележки".
 
@@ -149,12 +162,80 @@ def filter_obstacles_by_height(
     Args:
         world_points: N×3 (x, y, z) в мировой системе
         min_height_m, max_height_m: диапазон z, который считается препятствием
+        return_mask: вернуть также булеву маску по входным точкам (для отладки —
+                     какие именно пиксели стали препятствиями)
     """
     if len(world_points) == 0:
+        if return_mask:
+            return world_points, np.zeros(0, dtype=bool)
         return world_points
     z = world_points[:, 2]
     mask = (z >= min_height_m) & (z <= max_height_m)
+    if return_mask:
+        return world_points[mask], mask
     return world_points[mask]
+
+
+def nearest_in_depth_band(
+    depth_map: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    mount: CameraMount,
+    band_halfheight_frac: float = 0.05,
+    central_width_frac: float = 0.55,
+    near_percentile: float = 10.0,
+    min_valid_px: int = 30,
+    min_depth_m: float = 0.15,
+    max_depth_m: float = 6.0,
+) -> Optional[float]:
+    """
+    «Максимальная близость объекта по курсу» прямо из карты глубины,
+    БЕЗ обратной проекции и фильтра высот — страховочный канал.
+
+    Зачем: основной пайплайн классифицирует препятствия по высоте точек
+    (3–50 см над полом). Если облако получилось редким — сетка, прозрачное,
+    тонкое, ошибка наклона камеры — фронт может промолчать. Эта функция
+    смотрит на УЗКУЮ ГОРИЗОНТАЛЬНУЮ ПОЛОСУ вокруг линии горизонта (оптической
+    оси с поправкой на tilt): пол в эти строки кадра попадает только на
+    большой дальности (для камеры на высоте 12.5 см и полосы ±5% кадра —
+    дальше ~2.9 м), поэтому всё БЛИЗКОЕ в полосе — вертикальное препятствие.
+
+    Наивный минимум по всему кадру так не работает: внизу кадра всегда пол
+    на 0.3–0.5 м — был бы вечный ложный стоп.
+
+    Args:
+        band_halfheight_frac: полувысота полосы в долях высоты кадра
+        central_width_frac: доля ширины кадра по центру (куда едем)
+        near_percentile: робастный «минимум» (отсекает битые пиксели глубины)
+        min_valid_px: минимум валидных пикселей в полосе, иначе None
+
+    Returns:
+        Дистанция до ближайшего объекта по курсу ОТ ЦЕНТРА РОБОТА (м),
+        или None (полоса пустая/невалидная).
+    """
+    h, w = depth_map.shape[:2]
+
+    # Линия горизонта с учётом наклона камеры: tilt > 0 (вниз) поднимает
+    # горизонт в кадре выше центра.
+    horizon_row = int(round(intrinsics.cy - intrinsics.fy * np.tan(mount.tilt_rad)))
+    half_band = max(2, int(round(h * band_halfheight_frac)))
+    r0 = max(0, horizon_row - half_band)
+    r1 = min(h, horizon_row + half_band)
+    if r1 - r0 < 3:
+        return None  # горизонт ушёл за кадр (сильный tilt) — канал не работает
+
+    half_w = max(2, int(round(w * central_width_frac / 2)))
+    c0 = max(0, w // 2 - half_w)
+    c1 = min(w, w // 2 + half_w)
+
+    band = depth_map[r0:r1, c0:c1]
+    valid = band[(band >= min_depth_m) & (band <= max_depth_m)]
+    if valid.size < min_valid_px:
+        return None
+
+    z_cam = float(np.percentile(valid, near_percentile))
+    # Глубина — вдоль оптической оси камеры; до центра робота добавляем
+    # вынос камеры (cos(tilt) ≈ 1 для малых углов учтён явно).
+    return z_cam * float(np.cos(mount.tilt_rad)) + mount.forward_offset_m
 
 
 def obstacle_distances_by_sector(
@@ -163,9 +244,10 @@ def obstacle_distances_by_sector(
     front_halfwidth_rad: float = np.pi / 6,   # ±30°, как сектор front у лидара
     side_max_rad: float = np.pi / 2,          # боковые секторы до ±90°
     min_range_m: float = 0.12,                # шумовой порог (само-обзор/артефакты)
-    max_range_m: float = 2.5,
+    max_range_m: float = 6.0,
     min_points: int = 3,
     near_percentile: float = 15.0,
+    corridor_halfwidth_m: Optional[float] = None,
 ) -> dict:
     """
     Оценить расстояние до ближайшего препятствия в секторах front/left/right
@@ -178,6 +260,17 @@ def obstacle_distances_by_sector(
     почти только сектор front. Боковые секторы клиппируются краем кадра и обычно
     пусты — это ожидаемо, а не ошибка.
 
+    КОРИДОРНАЯ МЕТРИКА (corridor_halfwidth_m): дополнительная оценка «сколько
+    можно проехать прямо». Берутся точки, чьё ПОПЕРЕЧНОЕ смещение в системе
+    робота не превышает полуширины коридора (полкорпуса + запас), независимо
+    от пеленга — и из них считается продольная дистанция. Это закрывает два
+    кейса, где угловой сектор слаб:
+      - угловое препятствие «под колесо»: близкий предмет на пеленге >30°
+        в сектор front не попадает, но в полосу движения — попадает;
+      - стена под острым углом (диагональный подъезд): её ближний край
+        лежит в коридоре, даже если основная масса точек в боковом секторе.
+    Итоговый front = min(сектор, коридор).
+
     Робастная оценка ближнего препятствия — перцентиль near_percentile по
     дальностям точек сектора: защищает от одиночных выбросов глубины (которые
     иначе вызывали бы ложную экстренную остановку). Требуется минимум
@@ -186,11 +279,13 @@ def obstacle_distances_by_sector(
     Args:
         obstacles_world: N×3 (x, y, z) в мировой системе, уже по высоте.
         robot_pose: (x, y, theta) робота в мировой системе.
+        corridor_halfwidth_m: полуширина коридора движения (м); None — выкл.
 
     Returns:
-        {'front': dist|None, 'left': dist|None, 'right': dist|None}
+        {'front': dist|None, 'left': dist|None, 'right': dist|None,
+         'front_corridor': dist|None}  — front уже учитывает коридор.
     """
-    result = {'front': None, 'left': None, 'right': None}
+    result = {'front': None, 'left': None, 'right': None, 'front_corridor': None}
     if obstacles_world is None or len(obstacles_world) == 0:
         return result
 
@@ -215,5 +310,20 @@ def obstacle_distances_by_sector(
         sel = ranges[valid & sec_mask]
         if sel.size >= min_points:
             result[name] = float(np.percentile(sel, near_percentile))
+
+    # Коридор: точки в полосе движения робота, дистанция — продольная (x_r).
+    if corridor_halfwidth_m is not None:
+        cos_t = np.cos(rtheta)
+        sin_t = np.sin(rtheta)
+        x_r = cos_t * dx + sin_t * dy    # вперёд по курсу
+        y_r = -sin_t * dx + cos_t * dy   # влево от курса
+        in_corridor = ((x_r >= min_range_m) & (x_r <= max_range_m)
+                       & (np.abs(y_r) <= corridor_halfwidth_m))
+        sel = x_r[in_corridor]
+        if sel.size >= min_points:
+            corridor = float(np.percentile(sel, near_percentile))
+            result['front_corridor'] = corridor
+            if result['front'] is None or corridor < result['front']:
+                result['front'] = corridor
 
     return result

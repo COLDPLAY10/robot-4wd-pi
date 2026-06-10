@@ -14,8 +14,10 @@ from .projection import (
     CameraMount,
     backproject_depth_to_world,
     filter_obstacles_by_height,
+    nearest_in_depth_band,
     obstacle_distances_by_sector,
 )
+from .debug_viz import render_depth_debug
 
 __all__ = [
     'DepthEstimator',
@@ -23,5 +25,7 @@ __all__ = [
     'CameraMount',
     'backproject_depth_to_world',
     'filter_obstacles_by_height',
+    'nearest_in_depth_band',
     'obstacle_distances_by_sector',
+    'render_depth_debug',
 ]
