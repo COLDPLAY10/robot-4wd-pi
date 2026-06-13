@@ -304,14 +304,15 @@ class LidarDriver:
 
     def get_scan(self) -> List[Tuple[float, float]]:
         """
-        Последний полный оборот: [(угол_рад, дистанция_м), ...].
+        Последний ПОЛНЫЙ оборот: [(угол_рад, дистанция_м), ...].
         Угол в системе робота: 0 — вперёд, против часовой положительное,
         диапазон [-pi, pi].
+
+        До первого полного оборота возвращает [] — частичный сектор в SLAM
+        и слияние отдавать нельзя: «пустые» направления читаются как простор.
         """
         with self.lock:
-            if self.scan_data:
-                return list(self.scan_data)
-            return list(self._current_rev)
+            return list(self.scan_data)
 
     def get_scan_degrees(self) -> List[Tuple[float, float]]:
         """Скан в градусах [0..360), отсортированный по углу."""

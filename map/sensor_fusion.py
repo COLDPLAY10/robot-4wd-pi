@@ -58,6 +58,11 @@ class SensorFusion:
         # данные ультразвука/камеры успевали «протухнуть» за время одного тика
         # с камерой, и слияние их выбрасывало («ультразвук не сканируется»).
         self.data_timeout = 2.5
+        # Для КАМЕРЫ отдельный, более короткий таймаут реактивности: секторные
+        # дистанции сняты в кадре робота на момент кадра и не компенсируют
+        # последующий поворот корпуса — двухсекундный «front» после доворота
+        # реально смотрит вбок.
+        self.camera_timeout = 1.5
 
         print(f"[SensorFusion] Инициализирована")
         print(f"  Лидар: {'да' if use_lidar else 'нет'}")
@@ -107,6 +112,14 @@ class SensorFusion:
         )
         self.last_camera_update = time.time()
 
+    def invalidate_camera(self):
+        """
+        Сбросить данные камеры — вызывается контроллером после поворота на
+        месте: секторные дистанции сняты в старом курсе робота и после
+        доворота показывают «вбок», а не вперёд.
+        """
+        self.camera_data = None
+
     def update_ultrasonic(self, distance: float):
         """
         Обновление данных ультразвукового датчика
@@ -139,9 +152,14 @@ class SensorFusion:
 
         # --- Лидар: основной дальномер ---
         lidar_dist = None
+        lidar_narrow = None
         if (self.use_lidar and self.lidar_data is not None
                 and current_time - self.last_lidar_update < self.data_timeout):
             lidar_dist = self._extract_lidar_distance(self.lidar_data.data, direction)
+            if direction == 'front':
+                # Узкий фронт ±15° = конус УЗ — нужен кросс-проверке конфликта
+                lidar_narrow = self._extract_lidar_distance(
+                    self.lidar_data.data, 'front_narrow')
 
         # --- Ультразвук: только вперёд ---
         ultrasonic_dist = None
@@ -153,12 +171,13 @@ class SensorFusion:
                 ultrasonic_dist = dist
 
         # Базовая оценка по «надёжным» дальномерам (лидар + ультразвук).
-        base = self._combine_range_sensors(lidar_dist, ultrasonic_dist)
+        base = self._combine_range_sensors(lidar_dist, ultrasonic_dist,
+                                           lidar_narrow)
 
         # --- Камера (depth): секторные расстояния из карты глубины ---
         camera_dist = None
         if (self.use_camera and self.camera_data is not None
-                and current_time - self.last_camera_update < self.data_timeout):
+                and current_time - self.last_camera_update < self.camera_timeout):
             camera_dist = self.camera_data.data.get(direction)
 
         # Слияние камеры с базовой оценкой.
@@ -237,76 +256,90 @@ class SensorFusion:
 
         return result
 
+    # Минимальное доверительное расстояние лидара — ближе T-MINI Plus шумит
+    LIDAR_MIN_RELIABLE_DIST = 0.12
+    # Но МНОГО под-12см точек в секторе — это не шум, а прижатая стена/объект
+    NEAR_CLUSTER_MIN_POINTS = 5
+
     def _extract_lidar_distance(self, scan_data, direction: str) -> Optional[float]:
         """
         Извлечение расстояния из данных лидара для заданного направления.
-        Использует медианную фильтрацию для устойчивости к шуму.
+        Робастный минимум: третья ближайшая точка сектора — отбрасывает
+        одиночные шумовые выбросы, но НЕ растворяет узкие объекты (ножка
+        стула даёт 2-5 точек; прежняя медиана нижнего квартиля топила их
+        в точках дальней стены позади).
         """
         if not scan_data:
             return None
 
         # Определяем диапазон углов для направления
         angle_ranges = {
-            'front': (-np.pi/6, np.pi/6),      # ±30 градусов
-            'right': (-np.pi/2, -np.pi/6),     # -90 до -30
-            'left': (np.pi/6, np.pi/2),        # 30 до 90
-            'back': None                         # обрабатывается отдельно
+            'front': (-np.pi/6, np.pi/6),        # ±30 градусов
+            'front_narrow': (-np.pi/12, np.pi/12),  # ±15° — конус УЗ
+            'right': (-np.pi/2, -np.pi/6),       # -90 до -30
+            'left': (np.pi/6, np.pi/2),          # 30 до 90
+            'back': None                          # обрабатывается отдельно
         }
 
         if direction not in angle_ranges:
             return None
 
-        # Минимальное доверительное расстояние лидара — точки ближе считаются шумом
-        LIDAR_MIN_RELIABLE_DIST = 0.12  # 12 см — ближе этого T-MINI Plus шумит
-
         sector_distances = []
+        near_count = 0  # точки ближе порога шума — счётчик «прижатого» объекта
 
         for angle, distance in scan_data:
-            # Отбрасываем заведомо шумные точки (слишком близкие)
-            if distance < LIDAR_MIN_RELIABLE_DIST:
-                continue
-
             angle = self._normalize_angle(angle)
-
             if direction == 'back':
-                if abs(angle) > 5 * np.pi / 6:
-                    sector_distances.append(distance)
+                in_sector = abs(angle) > 5 * np.pi / 6
             else:
                 min_angle, max_angle = angle_ranges[direction]
-                if min_angle <= angle <= max_angle:
-                    sector_distances.append(distance)
+                in_sector = min_angle <= angle <= max_angle
+            if not in_sector:
+                continue
+            if distance < self.LIDAR_MIN_RELIABLE_DIST:
+                near_count += 1
+                continue
+            sector_distances.append(distance)
 
-        if not sector_distances:
-            return None
-
-        # Медианная фильтрация: берём медиану нижних 25% точек (ближайших),
-        # но только если их достаточно (минимум 3 точки), иначе — одиночный выброс
         sector_distances.sort()
+
+        # Прижатая стена/объект: кластер под-12см точек при «пустом» или
+        # дальнем секторе. Раньше такие точки выкидывались целиком, сектор
+        # читался как простор, и выбор стороны вёл РОБОТА В СТЕНУ.
+        if near_count >= self.NEAR_CLUSTER_MIN_POINTS and (
+                not sector_distances or sector_distances[0] > 0.5):
+            return 0.10
+
         if len(sector_distances) < 3:
-            # Мало точек — недостаточно данных, не доверяем
             return None
 
-        # Берём нижний квартиль и считаем его медиану
-        q1_count = max(3, len(sector_distances) // 4)
-        closest_points = sector_distances[:q1_count]
-        median_dist = float(np.median(closest_points))
-
-        return median_dist
+        # Робастный минимум: третья ближайшая точка
+        return float(sector_distances[2])
 
     @staticmethod
     def _combine_range_sensors(lidar_dist: Optional[float],
-                               ultrasonic_dist: Optional[float]) -> Optional[float]:
+                               ultrasonic_dist: Optional[float],
+                               lidar_narrow: Optional[float] = None) -> Optional[float]:
         """
         Кросс-валидация лидара и ультразвука — двух «надёжных» дальномеров.
         Лидар основной; ультразвук уточняет вблизи и страхует от шума лидара.
+
+        Args:
+            lidar_narrow: фронт лидара в узком секторе ±15° (= конус УЗ).
+                Конфликт «лидар близко, УЗ далеко» разрешается в пользу УЗ
+                ТОЛЬКО если близкие точки лежат в его конусе — иначе (объект
+                на пеленге 15–30°, ножка стула) УЗ его физически не видит,
+                и его «свободно» ничего не опровергает.
         """
         if lidar_dist is not None and ultrasonic_dist is not None:
-            # Лидар говорит «очень близко», а ультразвук «свободно» — лидар
-            # шумит, доверяем ультразвуку.
             if lidar_dist < 0.20 and ultrasonic_dist > 0.40:
-                print(f"[SensorFusion] ⚠️ Конфликт: лидар={lidar_dist:.2f}м, "
-                      f"ультразвук={ultrasonic_dist:.2f}м → доверяем ультразвуку")
-                return ultrasonic_dist
+                if lidar_narrow is not None and lidar_narrow < 0.20:
+                    # Близкие точки в конусе УЗ, а УЗ их не видит — шум лидара
+                    print(f"[SensorFusion] ⚠️ Конфликт: лидар={lidar_dist:.2f}м, "
+                          f"ультразвук={ultrasonic_dist:.2f}м → доверяем ультразвуку")
+                    return ultrasonic_dist
+                # Близкие точки ВНЕ конуса УЗ — УЗ просто смотрит мимо
+                return lidar_dist
             # Оба примерно согласны — средневзвешенное (лидар точнее).
             return lidar_dist * 0.6 + ultrasonic_dist * 0.4
         if lidar_dist is not None:

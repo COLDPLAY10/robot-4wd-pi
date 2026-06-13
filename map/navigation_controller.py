@@ -42,6 +42,11 @@ class _DepthWorker(threading.Thread):
     Поза снимается В МОМЕНТ ЗАХВАТА кадра: проекция облака должна считаться
     от позы, в которой кадр снят, а не от позы на момент потребления — робот
     успевает уехать за время инференса.
+
+    Известный компромисс: get_pose читает x/y/theta без блокировки, пока
+    главный поток их мутирует — возможна «рваная» поза из соседних тиков.
+    При наших скоростях (≤0.16 м/с, тик ≤0.2 с) ошибка миллиметровая, на фоне
+    шума монокулярной глубины пренебрежима. Решили не тащить лок в SLAM.
     """
 
     def __init__(self, cap, estimator, get_pose, period_s: float):
@@ -146,11 +151,7 @@ class NavigationController:
 
         # ROBOT_RADIUS/SAFETY_MARGIN — single source of truth, чтобы inflation
         # в карте соответствовал реальному footprint тележки.
-        self.path_planner = PathPlanner(
-            self.slam.map,
-            robot_radius=self.ROBOT_RADIUS,
-            inflation_margin=self.SAFETY_MARGIN,
-        )
+        self.path_planner = self._make_path_planner()
 
         # Режим работы
         self.mode = NavigationMode.IDLE
@@ -158,9 +159,14 @@ class NavigationController:
         # Параметры движения (откалибровано для 4WD)
         self.exploration_speed = 30      # Скорость для исследования (PWM, мин. для реального движения)
         self.navigation_speed = 40       # Скорость для навигации по маршруту
-        self.turn_speed = 20             # Скорость поворота
+        # Поворот на месте — самое тяжёлое движение мекалума (скрэб колёс):
+        # PWM ниже порога трогания (22) даёт фантомный поворот в одометрии
+        # при стоящих колёсах.
+        self.turn_speed = 25             # Скорость поворота
         self.min_obstacle_distance = 0.4 # Минимальное расстояние до препятствия (м)
-        self.critical_distance = 0.15    # Критическое расстояние для экстренной остановки
+        # Дистанции меряются ОТ ЦЕНТРА робота; нос камеры ~0.12 м впереди,
+        # поэтому 0.20 от центра = ~8 см от носа (старые 0.15 = 3 см).
+        self.critical_distance = 0.20    # Критическое расстояние для экстренной остановки
         self.goal_tolerance = 0.2        # допустимое отклонение от цели (м)
 
         # Текущая цель
@@ -175,9 +181,14 @@ class NavigationController:
         self._depth_consumed_ts = 0.0
 
         # Отслеживание движения для одометрии
-        self.current_command = "stop"  # stop, forward, forward_steer, backward, rotate_left, rotate_right
+        self.current_command = "stop"  # stop, forward, forward_steer, tank, backward, rotate_left, rotate_right
         self.current_speed = 0   # PWM 0-255
         self.current_steer = 0.0  # процент увода для forward_steer (см. move_param_forward)
+        self.current_tank = (0, 0)  # PWM бортов для команды tank (DWA)
+
+        # Состояние DWA-навигации
+        self._dwa_vel = (0.0, 0.0)   # последняя командованная (v, omega)
+        self._dwa_stall_count = 0    # подряд тактов «нет проходимой траектории»
 
         # Счетчик последовательных поворотов (для предотвращения зацикливания)
         self.consecutive_rotations = 0
@@ -486,10 +497,32 @@ class NavigationController:
         if path:
             self.current_path = path
             self.current_waypoint_idx = 0
+            self._dwa_vel = (0.0, 0.0)
+            self._dwa_stall_count = 0
+            self._dwa_replan_count = 0
+            self._avoid_count = 0
             self.mode = NavigationMode.NAVIGATION
             print(f"[NavController] Путь построен: {len(path)} точек")
         else:
-            print("[NavController] Не удалось построить путь, переход в режим исследования")
+            self._goal_unreachable("путь не построен")
+
+    def _goal_unreachable(self, reason: str):
+        """
+        Терминальный исход «до цели не доехать». В localization блуждание
+        бессмысленно: карта read-only, проход в ней не «откроется», а demo
+        ждёт IDLE — раньше робот в этой ситуации навсегда уходил в
+        EXPLORATION и скрипт не завершался. В mapping исследование оставляем:
+        карта пополняется, проход может найтись.
+        """
+        if self.mapping_mode == 'localization':
+            print(f"[NavController] ⛔ ЦЕЛЬ НЕДОСТИЖИМА ({reason}) — останавливаюсь")
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            self.current_goal = None
+            self.current_path = []
+            self.mode = NavigationMode.IDLE
+        else:
+            print(f"[NavController] Цель пока недостижима ({reason}) — исследую")
             self.mode = NavigationMode.EXPLORATION
 
     def start_exploration(self):
@@ -562,6 +595,7 @@ class NavigationController:
                         pixel_stride=self.CAMERA_PIXEL_STRIDE,
                         max_range_m=self.CAMERA_MAX_RANGE_M,
                         map_write_max_range_m=self.CAMERA_MAP_MAX_RANGE_M,
+                        robot_pose=pose,
                     )
                     # Реактивный слой: секторные расстояния + коридор
                     # движения из того же облака → в sensor_fusion.
@@ -604,11 +638,23 @@ class NavigationController:
             try:
                 lidar_scan = self.lidar.get_scan()
                 if lidar_scan and len(lidar_scan) > 0:
-                    # Фильтрация шума: отбрасываем точки ближе 12 см (шум T-MINI Plus)
-                    filtered_scan = [(a, d) for a, d in lidar_scan if d >= 0.12]
-                    if filtered_scan:
-                        self.sensor_fusion.update_lidar(filtered_scan)
-                        self.slam.update_with_lidar(filtered_scan)
+                    # В слияние — СЫРОЙ скан: под-12см точки нужны детектору
+                    # «прижатой стены» (sensor_fusion сам их интерпретирует)
+                    self.sensor_fusion.update_lidar(lidar_scan)
+
+                    # В SLAM: только НОВЫЙ оборот (иначе один скан пишется в
+                    # карту 2-3 раза до следующего оборота — насыщает log-odds
+                    # шумом и жжёт CPU) и только при умеренном вращении
+                    # (точки оборота копятся ~150 мс и при ω>0.6 рад/с
+                    # размазываются на 5-15° — мажут карту и матчер).
+                    rev = getattr(self.lidar, 'revolution_count', None)
+                    is_new_rev = rev is None or rev != getattr(self, '_last_lidar_rev', None)
+                    _, omega_now = self._commanded_velocity()
+                    if is_new_rev and abs(omega_now) <= 0.6:
+                        filtered_scan = [(a, d) for a, d in lidar_scan if d >= 0.12]
+                        if filtered_scan:
+                            self._last_lidar_rev = rev
+                            self.slam.update_with_lidar(filtered_scan)
             except Exception as e:
                 self._log_sensor_error('lidar', e)
 
@@ -621,7 +667,12 @@ class NavigationController:
                 if distance_cm is not None and distance_cm > 0:
                     distance_m = distance_cm / 100.0
                     self.sensor_fusion.update_ultrasonic(distance_m)
-                    self.slam.update_with_ultrasonic(distance_m)
+                    # В карту — не чаще 2 Гц: конус из 7 лучей каждым тиком
+                    # насыщал дуги тем же показанием
+                    now_us = time.time()
+                    if now_us - getattr(self, '_last_us_map_write', 0.0) >= 0.5:
+                        self._last_us_map_write = now_us
+                        self.slam.update_with_ultrasonic(distance_m)
             except Exception as e:
                 self._log_sensor_error('ultrasonic', e)
 
@@ -672,6 +723,22 @@ class NavigationController:
         if dt <= 0.0:
             return
 
+        v, omega = self._commanded_velocity()
+
+        # Конвертация (v, omega) → скорости бортов для diff-drive модели в SLAM.
+        # SLAM сам пересчитает обратно: v=(l+r)/2, omega=(r-l)/wheel_base.
+        half_base = self.WHEEL_BASE / 2.0
+        left_speed = v - omega * half_base
+        right_speed = v + omega * half_base
+
+        self.slam.update_odometry(left_speed, right_speed, dt)
+
+    def _commanded_velocity(self) -> Tuple[float, float]:
+        """
+        Модель актуатора: (v, omega), которые робот исполняет ПРЯМО СЕЙЧАС
+        по активной команде. Единственное место, где команда переводится в
+        скорости, — используется одометрией и гейтами записи в карту.
+        """
         # PWM в car_adapter лежит в диапазоне 0..255, current_speed хранится так же.
         pwm_factor = min(1.0, max(0.0, self.current_speed / self.PWM_FULL))
         v_max = self.MAX_LINEAR_SPEED * pwm_factor
@@ -683,13 +750,21 @@ class NavigationController:
             v, omega = v_max, 0.0
         elif cmd == "forward_steer":
             # Подруливание дифференциалом бортов (move_param_forward):
-            # p>0 усиливает ПРАВЫЙ борт на p% → средняя скорость растёт на
-            # p/2%, а робот заворачивает ВЛЕВО (omega>0). Модель обязана
+            # при ЛЮБОМ знаке p один из бортов УСИЛИВАЕТСЯ на |p|% — средняя
+            # скорость всегда растёт (v×(1+|p|/200)); знак p задаёт только
+            # сторону (p>0 → правый борт → влево, omega>0). Модель обязана
             # совпадать с тем, что реально делает car_adapter, иначе
             # одометрия поедет мимо scan matcher'а.
             p = self.current_steer
-            v = v_max * (1.0 + p / 200.0)
+            v = v_max * (1.0 + abs(p) / 200.0)
             omega = (v_max * (p / 100.0)) / self.WHEEL_BASE
+        elif cmd == "tank":
+            # DWA: борта заданы напрямую — восстанавливаем (v, omega) из PWM
+            l_pwm, r_pwm = self.current_tank
+            v_l = self.MAX_LINEAR_SPEED * l_pwm / self.PWM_FULL
+            v_r = self.MAX_LINEAR_SPEED * r_pwm / self.PWM_FULL
+            v = (v_l + v_r) / 2.0
+            omega = (v_r - v_l) / self.WHEEL_BASE
         elif cmd == "backward":
             v, omega = -v_max, 0.0
         elif cmd == "rotate_left":
@@ -700,13 +775,7 @@ class NavigationController:
             # stop, либо боковое мекалум-движение — в одометрии не учитываем
             v, omega = 0.0, 0.0
 
-        # Конвертация (v, omega) → скорости бортов для diff-drive модели в SLAM.
-        # SLAM сам пересчитает обратно: v=(l+r)/2, omega=(r-l)/wheel_base.
-        half_base = self.WHEEL_BASE / 2.0
-        left_speed = v - omega * half_base
-        right_speed = v + omega * half_base
-
-        self.slam.update_odometry(left_speed, right_speed, dt)
+        return v, omega
 
     def _tick(self, dt_max: float = 0.5):
         """
@@ -719,28 +788,91 @@ class NavigationController:
         if dt > dt_max:
             dt = dt_max  # защита от больших dt после блокирующих участков
         self.last_update_time = now
-        self._update_sensors()
+        # Сначала одометрия, потом сенсоры: скан снят «сейчас» и должен
+        # матчиться против позы, продвинутой на текущий dt, — иначе прайр
+        # матчера систематически отстаёт на тик.
         self._update_odometry(dt)
+        self._update_sensors()
 
-    def _set_movement_command(self, command: str, speed: int, steer: float = 0.0):
+    def _set_movement_command(self, command: str, speed: int, steer: float = 0.0,
+                              tank=(0, 0)):
         """
         Установка команды движения для отслеживания одометрии
 
         Args:
-            command: тип команды (forward, forward_steer, backward,
+            command: тип команды (forward, forward_steer, tank, backward,
                      rotate_left, rotate_right, stop)
             speed: скорость PWM (0-255) — номинал борта ДО усиления steer'ом
             steer: для forward_steer — процент усиления борта, как в
                    car_adapter.move_param_forward (p>0 → правый борт → влево)
+            tank: для tank — подписанные PWM бортов (left, right)
         """
         self.current_command = command
         self.current_speed = speed
         self.current_steer = float(steer)
+        self.current_tank = tank
 
     # ===== Параметры плавного движения =====
     SLOWDOWN_START_M = 0.7   # с этой дистанции начинаем плавно сбрасывать PWM
     MIN_MOVE_PWM = 22        # ниже TT-моторы у порога трогания (стиктион)
     CRUISE_STEER_MAX = 20.0  # макс. увод к простору на круизе, % борта
+
+    # ===== DWA: локальный планировщик в режиме NAVIGATION =====
+    # Один флаг отката: если в поле DWA ведёт себя странно — False возвращает
+    # прежнее дискретное поведение (повороты на месте + отрезки).
+    DWA_ENABLED = True
+    DWA_MAX_SPEED_M_S = 0.16   # потолок линейной скорости DWA (≈ PWM 68)
+    DWA_MAX_YAW_RATE = 1.2     # потолок угловой скорости, рад/с
+    # Порог объезда ОБЯЗАН быть выше «полосы замирания» квантования:
+    # v_cap = 0.5·(front−0.20) обнуляет команду при front < ~0.30 (порог
+    # трогания 22 PWM = 0.052 м/с); при 0.28 робот замирал на 0.30, не
+    # доходя до порога объезда, и вечно перепланировал.
+    DWA_BLOCK_FRONT_M = 0.32   # реактивный фронт ближе — стоп и режим объезда
+    DWA_STALL_LIMIT = 12       # тактов подряд без движения → перепланирование
+    DWA_REPLAN_LIMIT = 2       # подряд безрезультатных перепланирований → объезд
+    DWA_NO_DATA_TICKS = 5      # тактов без фронт-данных → ползущий кап
+
+    def _send_velocity_command(self, v: float, omega: float,
+                               allow_bump: bool = True):
+        """
+        (v, omega) → PWM бортов → моторы. Возвращает ФАКТИЧЕСКИ исполненную
+        пару (v, omega) после квантования мёртвой зоны моторов — её же
+        получает одометрия (команда tank) и следующий такт DWA как current_vel.
+
+        Квантование: |PWM| < MIN_MOVE_PWM/2 → 0 (колесо всё равно не тронется),
+        иначе < MIN_MOVE_PWM → подтягиваем до порога трогания. Честная модель
+        актуатора важнее точного следования идеальной дуге — DWA всё равно
+        перепланирует на следующем такте.
+
+        allow_bump=False: подтяжку вверх запрещаем (округляем в 0) — нужно,
+        когда реактивный кап скорости НИЖЕ порога трогания: иначе квантование
+        пробивало бы кап в 1.5–2 раза у самого препятствия.
+        """
+        half_base = self.WHEEL_BASE / 2.0
+        v_l = v - omega * half_base
+        v_r = v + omega * half_base
+
+        def to_pwm(speed_ms: float) -> int:
+            pwm = speed_ms / self.MAX_LINEAR_SPEED * self.PWM_FULL
+            if abs(pwm) < self.MIN_MOVE_PWM / 2.0:
+                return 0
+            if abs(pwm) < self.MIN_MOVE_PWM:
+                return int(np.sign(pwm) * self.MIN_MOVE_PWM) if allow_bump else 0
+            return int(np.clip(round(pwm), -255, 255))
+
+        l_pwm, r_pwm = to_pwm(v_l), to_pwm(v_r)
+        if l_pwm == 0 and r_pwm == 0:
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            return 0.0, 0.0
+
+        ca.move_tank(l_pwm, r_pwm)
+        self._set_movement_command("tank", max(abs(l_pwm), abs(r_pwm)),
+                                   tank=(l_pwm, r_pwm))
+        # Фактические скорости после квантования
+        v_l_q = self.MAX_LINEAR_SPEED * l_pwm / self.PWM_FULL
+        v_r_q = self.MAX_LINEAR_SPEED * r_pwm / self.PWM_FULL
+        return (v_l_q + v_r_q) / 2.0, (v_r_q - v_l_q) / self.WHEEL_BASE
 
     def _apply_forward(self, pwm: int, steer: float):
         """Послать моторную команду «вперёд» (с уводом или без) + одометрия."""
@@ -959,6 +1091,9 @@ class NavigationController:
         finally:
             ca.stop_robot()
             self._set_movement_command("stop", 0)
+            # Секторные дистанции камеры сняты в СТАРОМ курсе — после
+            # доворота её «front» смотрит вбок; сбрасываем до нового кадра.
+            self.sensor_fusion.invalidate_camera()
             time.sleep(0.2)
         return safe
 
@@ -969,6 +1104,37 @@ class NavigationController:
     def _safe_rotate_right(self, max_duration: float = 1.0, check_interval: float = 0.2) -> bool:
         return self._safe_rotate('right', max_duration, check_interval)
 
+    def _safe_backward(self, duration: float, check_interval: float = 0.2) -> bool:
+        """
+        Отъезд назад с контролем ЗАДНЕЙ дистанции (лидар видит 360°, сектор
+        'back' обязан участвовать — раньше все отъезды были слепыми).
+
+        Returns:
+            False — сзади препятствие (отъезд отменён или прерван).
+        """
+        back = self.sensor_fusion.get_obstacle_distance('back')
+        if back is not None and back < 0.25:
+            print(f"[SAFETY] Сзади занято ({back:.2f}м) — отъезд отменён")
+            return False
+
+        ca.move_backward(self.exploration_speed)
+        self._set_movement_command("backward", self.exploration_speed)
+        self.last_update_time = time.time()
+        ok = True
+        end = time.time() + duration
+        while time.time() < end:
+            time.sleep(min(check_interval, max(0.0, end - time.time())))
+            self._tick()
+            back = self.sensor_fusion.get_obstacle_distance('back')
+            if back is not None and back < 0.20:
+                print(f"[SAFETY] Препятствие сзади ({back:.2f}м) — стоп")
+                ok = False
+                break
+        ca.stop_robot()
+        self._set_movement_command("stop", 0)
+        time.sleep(0.3)
+        return ok
+
     def _emergency_stop_and_back(self):
         """Экстренная остановка и отъезд назад"""
         print("[SAFETY] ⚠️ ЭКСТРЕННАЯ ОСТАНОВКА!")
@@ -978,16 +1144,9 @@ class NavigationController:
         self._set_movement_command("stop", 0)
         time.sleep(0.3)
 
-        # Отъезжаем немного назад с накоплением одометрии
+        # Отъезжаем немного назад с накоплением одометрии и контролем тыла
         print("[SAFETY] Отъезжаю назад...")
-        ca.move_backward(self.exploration_speed)
-        self._set_movement_command("backward", self.exploration_speed)
-        self.last_update_time = time.time()
-        self._timed_drive(0.8, check_interval=0.2)
-
-        ca.stop_robot()
-        self._set_movement_command("stop", 0)
-        time.sleep(0.3)
+        self._safe_backward(0.8)
 
     def _timed_drive(self, duration: float, check_interval: float = 0.2):
         """
@@ -1061,15 +1220,9 @@ class NavigationController:
                 print("[NAV_DEBUG] ⚠️ Зацикливание на поворотах! Пробую объезд...")
                 self.consecutive_rotations = 0
 
-                # Отъезжаем назад с тиками одометрии
+                # Отъезжаем назад с тиками одометрии и контролем тыла
                 print("[NAV_DEBUG] Отъезжаю назад...")
-                ca.move_backward(self.exploration_speed)
-                self._set_movement_command("backward", self.exploration_speed)
-                self.last_update_time = time.time()
-                self._timed_drive(0.7)
-                ca.stop_robot()
-                self._set_movement_command("stop", 0)
-                time.sleep(0.3)
+                self._safe_backward(0.7)
 
                 # Ломаем зацикливание: крутим в ПРОТИВОПОЛОЖНУЮ от «свободной»
                 # стороны — в свободную мы уже навертелись и упёрлись.
@@ -1130,7 +1283,110 @@ class NavigationController:
                 else 'left')
 
     def _safe_navigation_behavior(self):
-        """Безопасное поведение в режиме навигации по маршруту"""
+        """Поведение в режиме навигации: DWA (по умолчанию) или legacy-автомат."""
+        if self.DWA_ENABLED:
+            self._dwa_navigation_step()
+        else:
+            self._legacy_navigation_behavior()
+
+    def _dwa_navigation_step(self):
+        """
+        Один НЕблокирующий такт DWA-навигации: вызывается из update() на
+        каждом тике (10–20 Гц). Робот непрерывно течёт по дугам к текущему
+        waypoint'у A*, плавно огибая препятствия по карте; реактивный слой
+        остаётся страховкой поверх (экстренный стоп + кап скорости).
+        """
+        # --- Путь пройден? ---
+        if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
+            print("[NavController] Цель достигнута")
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            self._dwa_vel = (0.0, 0.0)
+            self.mode = NavigationMode.IDLE
+            return
+
+        pose = self.slam.get_pose()
+        waypoint = self.current_path[self.current_waypoint_idx]
+        dist = float(np.hypot(waypoint.x - pose.x, waypoint.y - pose.y))
+
+        # --- Waypoint достигнут → следующий (без остановки) ---
+        if dist < self.goal_tolerance:
+            self.current_waypoint_idx += 1
+            print(f"[NavController] Waypoint {self.current_waypoint_idx}/"
+                  f"{len(self.current_path)} достигнут")
+            return
+
+        # --- Реактивная страховка поверх DWA ---
+        # DWA объезжает то, что ЕСТЬ В КАРТЕ; свежие/динамические препятствия
+        # (особенно в localization, где карта read-only) видит только
+        # реактивный слой — он и стопит.
+        front = self.sensor_fusion.get_obstacle_distance('front')
+        if front is not None and front < self.DWA_BLOCK_FRONT_M:
+            print(f"[NavController] Препятствие по курсу ({front:.2f}м), объезд")
+            ca.stop_robot()
+            self._set_movement_command("stop", 0)
+            self._dwa_vel = (0.0, 0.0)
+            self.mode = NavigationMode.OBSTACLE_AVOIDANCE
+            time.sleep(0.2)
+            return
+        # Кап скорости по фронту: чем ближе препятствие, тем медленнее
+        # позволяем DWA ехать (0.5 м/с² торможения с запасом).
+        v_cap = None
+        if front is not None:
+            v_cap = max(0.0, 0.5 * (front - 0.20))
+            self._dwa_no_data_count = 0
+        else:
+            # Сенсоры молчат: DWA видит только карту, свежие препятствия —
+            # нет. Полсекунды молчания → ползущий кап как страховка
+            # (в localization новое препятствие в карте НЕ появится).
+            self._dwa_no_data_count = getattr(self, '_dwa_no_data_count', 0) + 1
+            if self._dwa_no_data_count >= self.DWA_NO_DATA_TICKS:
+                v_cap = 0.06
+
+        # --- Шаг DWA ---
+        v, omega = self.path_planner.compute_velocity_command(
+            (pose.x, pose.y, pose.theta),
+            self._dwa_vel,
+            (waypoint.x, waypoint.y),
+            v_max_cap=v_cap,
+        )
+
+        # Кап ниже порога трогания моторов → запрещаем квантованию
+        # подтягивать PWM вверх (иначе пробьёт кап у самого препятствия)
+        floor_speed = self.MIN_MOVE_PWM / self.PWM_FULL * self.MAX_LINEAR_SPEED
+        allow_bump = v_cap is None or v_cap >= floor_speed
+        self._dwa_vel = self._send_velocity_command(v, omega, allow_bump=allow_bump)
+
+        # Stall-детектор: DWA не нашёл траекторию (вернул 0,0) ЛИБО команда
+        # заквантовалась в ноль (DWA «прижался» к препятствию, скорость упала
+        # ниже порога трогания моторов) — в обоих случаях робот фактически
+        # стоит, и через DWA_STALL_LIMIT тактов перепланируем A*. Повторные
+        # безрезультатные перепланирования (по той же карте они возвращают
+        # тот же путь) эскалируются в физический объезд.
+        if self._dwa_vel == (0.0, 0.0):
+            self._dwa_stall_count += 1
+            if self._dwa_stall_count >= self.DWA_STALL_LIMIT:
+                self._dwa_stall_count = 0
+                self._dwa_replan_count = getattr(self, '_dwa_replan_count', 0) + 1
+                if self._dwa_replan_count > self.DWA_REPLAN_LIMIT:
+                    print("[NavController] DWA: перепланирования не помогают — объезд")
+                    self._dwa_replan_count = 0
+                    self.mode = NavigationMode.OBSTACLE_AVOIDANCE
+                    return
+                print("[NavController] DWA: застой — перепланирую путь")
+                new_path = self.path_planner.plan_global_path(
+                    (pose.x, pose.y), self.current_goal)
+                if new_path:
+                    self.current_path = new_path
+                    self.current_waypoint_idx = 0
+                else:
+                    self.mode = NavigationMode.OBSTACLE_AVOIDANCE
+        else:
+            self._dwa_stall_count = 0
+            self._dwa_replan_count = 0
+
+    def _legacy_navigation_behavior(self):
+        """Прежний дискретный автомат навигации (откат при DWA_ENABLED=False)."""
 
         if not self.current_path or self.current_waypoint_idx >= len(self.current_path):
             # Путь пройден
@@ -1232,16 +1488,25 @@ class NavigationController:
         """Безопасное поведение при объезде препятствий"""
 
         print("[NavController] Безопасный объезд препятствия")
+
+        # Повторные объезды у одной и той же точки = путь физически
+        # заблокирован (в localization перепланирование по статичной карте
+        # возвращает тот же маршрут — без лимита это вечные качели).
+        pose0 = self.slam.get_pose()
+        last = getattr(self, '_avoid_last_pos', None)
+        if last is not None and np.hypot(pose0.x - last[0], pose0.y - last[1]) < 0.4:
+            self._avoid_count = getattr(self, '_avoid_count', 0) + 1
+        else:
+            self._avoid_count = 1
+        self._avoid_last_pos = (pose0.x, pose0.y)
+        if self.current_goal and self._avoid_count > 3:
+            self._avoid_count = 0
+            self._goal_unreachable("трижды объезжаю в одном месте")
+            return
         
-        # Сначала отъезжаем немного назад
+        # Сначала отъезжаем немного назад (с контролем заднего сектора)
         print("[NavController] Отъезжаю назад...")
-        ca.move_backward(self.exploration_speed)
-        self._set_movement_command("backward", self.exploration_speed)
-        self.last_update_time = time.time()
-        self._timed_drive(0.5)
-        ca.stop_robot()
-        self._set_movement_command("stop", 0)
-        time.sleep(0.3)
+        self._safe_backward(0.5)
         
         # Получаем свободные направления
         free_dirs = self.sensor_fusion.get_free_directions(self.min_obstacle_distance)
@@ -1276,12 +1541,14 @@ class NavigationController:
             if new_path:
                 self.current_path = new_path
                 self.current_waypoint_idx = 0
+                # Свежий старт DWA после манёвра
+                self._dwa_vel = (0.0, 0.0)
+                self._dwa_stall_count = 0
+                self._dwa_replan_count = 0
                 self.mode = NavigationMode.NAVIGATION
                 print("[NavController] Путь перепланирован")
             else:
-                # Не удалось перепланировать, возвращаемся к исследованию
-                print("[NavController] Не удалось перепланировать, продолжаю исследование")
-                self.mode = NavigationMode.EXPLORATION
+                self._goal_unreachable("перепланирование не нашло пути")
         else:
             # Нет цели, возвращаемся к исследованию
             self.mode = NavigationMode.EXPLORATION
@@ -1337,15 +1604,32 @@ class NavigationController:
         self.slam.save_map(filename,
                            inflation_radius_m=self.ROBOT_RADIUS + self.SAFETY_MARGIN)
 
-    def load_map(self, filename: str):
-        """Загрузка карты"""
-        self.slam.load_map(filename)
-        # Обновляем планировщик с теми же footprint-параметрами, что и при __init__
-        self.path_planner = PathPlanner(
+    def _make_path_planner(self) -> PathPlanner:
+        """
+        Создать PathPlanner с параметрами робота (footprint + пределы DWA).
+        Используется и в __init__, и в load_map — конфигурация одна.
+        """
+        planner = PathPlanner(
             self.slam.map,
             robot_radius=self.ROBOT_RADIUS,
             inflation_margin=self.SAFETY_MARGIN,
         )
+        # Пределы DWA — от реальной кинематики (single source of truth здесь).
+        # Скоростной потолок умеренный: безопасная демонстрационная езда.
+        planner.max_speed = self.DWA_MAX_SPEED_M_S
+        planner.max_yaw_rate = self.DWA_MAX_YAW_RATE
+        planner.max_accel = 0.4
+        planner.max_delta_yaw_rate = 2.0
+        planner.window_dt = 0.3
+        planner.predict_time = 2.2
+        planner.dt = 0.15
+        return planner
+
+    def load_map(self, filename: str):
+        """Загрузка карты"""
+        self.slam.load_map(filename)
+        # Обновляем планировщик с теми же параметрами, что и при __init__
+        self.path_planner = self._make_path_planner()
 
     def get_status(self) -> dict:
         """Получение статуса системы"""

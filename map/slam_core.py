@@ -17,6 +17,11 @@ import numpy as np
 # модуль SLAM должен импортироваться без ошибок даже если matplotlib не запустится.
 
 
+# Длина историй траекторий: при ~20 Гц одометрии 1000 точек — всего ~50 с,
+# длинные прогоны обрезались на PNG и в compare_trajectory. 20000 ≈ 15-30 мин.
+_HISTORY_MAXLEN = 20000
+
+
 @dataclass
 class Position:
     """Позиция и ориентация робота"""
@@ -99,6 +104,36 @@ class OccupancyGrid:
         p_new = 1.0 / (1.0 + np.exp(-l_new))
         self.grid[gy, gx] = p_new * 100.0
 
+    def update_cells_batch(self, xs: np.ndarray, ys: np.ndarray,
+                           occupied: bool, confidence: float):
+        """
+        Векторное log-odds обновление массива точек (мировые координаты).
+
+        Зачем: лидарный оборот — ~600 лучей × десятки free-ячеек; поштучный
+        update_cell (np.log/np.exp на скаляр) занимал 0.1–0.4 с на Pi и
+        просаживал контур управления. Батч делает то же за миллисекунды.
+        Дубликаты ячеек ВНУТРИ батча схлопываются: один скан голосует за
+        ячейку один раз (поштучный вариант насыщал ячейку повторами).
+        """
+        gx = (xs / self.resolution + self.origin_x).astype(np.int32)
+        gy = (ys / self.resolution + self.origin_y).astype(np.int32)
+        m = (gx >= 0) & (gx < self.width) & (gy >= 0) & (gy < self.height)
+        if not m.any():
+            return
+        flat = np.unique(gy[m].astype(np.int64) * self.width + gx[m])
+        gyu = (flat // self.width).astype(np.int32)
+        gxu = (flat % self.width).astype(np.int32)
+
+        p = np.clip(self.grid[gyu, gxu] / 100.0, 0.01, 0.99)
+        l_prev = np.log(p / (1.0 - p))
+        if occupied:
+            p_meas = 0.5 + confidence * 0.45
+        else:
+            p_meas = 0.5 - confidence * 0.45
+        p_meas = min(max(p_meas, 0.01), 0.99)
+        l_new = np.clip(l_prev + np.log(p_meas / (1.0 - p_meas)), -5.0, 5.0)
+        self.grid[gyu, gxu] = (100.0 / (1.0 + np.exp(-l_new))).astype(np.float32)
+
     def is_occupied(self, x: float, y: float, threshold: float = 60) -> bool:
         """Проверка занятости точки"""
         gx, gy = self.world_to_grid(x, y)
@@ -165,7 +200,7 @@ class SLAM:
         # История позиций (SLAM, с коррекцией scan matcher).
         # ВАЖНО: кладём именно копию, иначе первая запись будет мутировать
         # вместе с current_position — и loop-closure всегда будет равен 0.
-        self.position_history = deque(maxlen=1000)
+        self.position_history = deque(maxlen=_HISTORY_MAXLEN)
         self.position_history.append(Position(
             x=self.current_position.x, y=self.current_position.y,
             theta=self.current_position.theta,
@@ -174,7 +209,7 @@ class SLAM:
         # Параллельный трекер чистой одометрии — копит дрейф независимо от
         # scan matcher. Нужен для отчёта "одометрия vs SLAM" на защите.
         self.odom_only_position = Position(x=0.0, y=0.0, theta=0.0, timestamp=time.time())
-        self.odom_only_history = deque(maxlen=1000)
+        self.odom_only_history = deque(maxlen=_HISTORY_MAXLEN)
         self.odom_only_history.append(Position(
             x=0.0, y=0.0, theta=0.0,
             timestamp=self.odom_only_position.timestamp))
@@ -262,9 +297,10 @@ class SLAM:
 
         # ---- Шаг 1: коррекция позы scan matcher'ом ----
         if self.scan_matcher is not None:
-            # Пересчёт likelihood field — не на каждом тике (дорого),
-            # а с throttle'ом внутри матчера.
-            if self.scan_matcher.needs_refresh():
+            # Пересчёт likelihood field — не на каждом тике (дорого), а с
+            # throttle'ом внутри матчера. В localization карта неизменна —
+            # поле строится один раз (в load_map) и не пересчитывается.
+            if self.mapping_mode == 'mapping' and self.scan_matcher.needs_refresh():
                 self.scan_matcher.update_likelihood_field(self.map)
 
             if self.scan_matcher.has_field():
@@ -296,27 +332,33 @@ class SLAM:
         robot_y = self.current_position.y
         robot_theta = self.current_position.theta
 
-        for angle, distance in scan_data:
-            if distance <= 0 or distance > 10.0:  # игнорируем невалидные измерения
-                continue
+        # Векторная запись скана (см. update_cells_batch): препятствия одним
+        # батчем, free-лучи — общей сеткой параметров с маской по длине луча.
+        pts = np.asarray([(a, d) for a, d in scan_data if 0.0 < d <= 10.0],
+                         dtype=np.float32)
+        if len(pts) == 0:
+            return
+        global_angles = robot_theta + pts[:, 0]
+        dists = pts[:, 1]
+        dx = dists * np.cos(global_angles)
+        dy = dists * np.sin(global_angles)
 
-            # Глобальный угол точки
-            global_angle = robot_theta + angle
+        # 1) Препятствия
+        self.map.update_cells_batch(robot_x + dx, robot_y + dy,
+                                    occupied=True, confidence=0.9)
 
-            # Координаты препятствия
-            obs_x = robot_x + distance * np.cos(global_angle)
-            obs_y = robot_y + distance * np.sin(global_angle)
-
-            # Отмечаем препятствие
-            self.map.update_cell(obs_x, obs_y, occupied=True, confidence=0.9)
-
-            # Отмечаем свободное пространство по лучу
-            num_steps = int(distance / self.map.resolution)
-            for i in range(1, num_steps):
-                t = i / num_steps
-                free_x = robot_x + t * distance * np.cos(global_angle)
-                free_y = robot_y + t * distance * np.sin(global_angle)
-                self.map.update_cell(free_x, free_y, occupied=False, confidence=0.5)
+        # 2) Свободное пространство вдоль лучей: для каждого луча шаги
+        #    i/num_steps, i=1..num_steps-1; сетка (лучи × max_steps) с маской.
+        steps = np.maximum(1, (dists / self.map.resolution).astype(np.int32))
+        max_steps = int(steps.max())
+        if max_steps > 1:
+            i_idx = np.arange(1, max_steps, dtype=np.float32)[None, :]
+            valid = i_idx < steps[:, None]
+            t = i_idx / steps[:, None].astype(np.float32)
+            free_x = robot_x + t * dx[:, None]
+            free_y = robot_y + t * dy[:, None]
+            self.map.update_cells_batch(free_x[valid], free_y[valid],
+                                        occupied=False, confidence=0.5)
 
     def update_with_ultrasonic(self, distance: float, sensor_angle: float = 0.0):
         """
@@ -374,7 +416,8 @@ class SLAM:
                                  min_obstacle_height_m: float = 0.03,
                                  max_obstacle_height_m: float = 0.50,
                                  max_range_m: float = 6.0,
-                                 map_write_max_range_m: Optional[float] = None):
+                                 map_write_max_range_m: Optional[float] = None,
+                                 robot_pose: Optional[Tuple[float, float, float]] = None):
         """
         Обновление карты препятствий из карты глубины (Depth-Anything-V2).
 
@@ -397,6 +440,12 @@ class SLAM:
                          Монокулярная глубина с дистанцией шумит всё сильнее,
                          а occupied-ячейка (conf 0.7) сразу блокирует A* —
                          поэтому в карту пишем консервативнее, чем анализируем.
+            robot_pose: поза робота (x, y, theta) В МОМЕНТ ЗАХВАТА КАДРА.
+                         Инференс глубины занимает 0.3–3 с в фоновом потоке —
+                         к моменту потребления робот успевает уехать, и проекция
+                         по текущей позе сдвигает облако на пройденный путь.
+                         None = текущая поза (для совместимости со старыми
+                         вызовами, где кадр обрабатывался синхронно).
         """
         if depth_map is None or depth_map.size == 0:
             return np.zeros((0, 3), dtype=np.float32)
@@ -405,9 +454,12 @@ class SLAM:
         from camera_perception.projection import (backproject_depth_to_world,
                                                    filter_obstacles_by_height)
 
-        robot_x = self.current_position.x
-        robot_y = self.current_position.y
-        robot_theta = self.current_position.theta
+        if robot_pose is not None:
+            robot_x, robot_y, robot_theta = robot_pose
+        else:
+            robot_x = self.current_position.x
+            robot_y = self.current_position.y
+            robot_theta = self.current_position.theta
 
         points = backproject_depth_to_world(
             depth_map, intrinsics, mount,
@@ -655,20 +707,24 @@ class SLAM:
             # Кладём в history именно копии (см. __init__ — иначе loop-closure = 0).
             now = time.time()
             self.current_position = Position(x=0.0, y=0.0, theta=0.0, timestamp=now)
-            self.position_history = deque(maxlen=1000)
+            self.position_history = deque(maxlen=_HISTORY_MAXLEN)
             self.position_history.append(Position(x=0.0, y=0.0, theta=0.0, timestamp=now))
 
             self.odom_only_position = Position(x=0.0, y=0.0, theta=0.0, timestamp=now)
-            self.odom_only_history = deque(maxlen=1000)
+            self.odom_only_history = deque(maxlen=_HISTORY_MAXLEN)
             self.odom_only_history.append(Position(x=0.0, y=0.0, theta=0.0, timestamp=now))
         else:
-            self.position_history = deque(data['position_history'], maxlen=1000)
+            self.position_history = deque(data['position_history'], maxlen=_HISTORY_MAXLEN)
             if self.position_history:
-                self.current_position = self.position_history[-1]
+                # Копия, не алиас: иначе первый же update_odometry мутирует
+                # загруженную точку истории (та же ловушка, что в __init__)
+                last = self.position_history[-1]
+                self.current_position = Position(
+                    x=last.x, y=last.y, theta=last.theta, timestamp=last.timestamp)
             # odom_only_history появилось позже формата — поддерживаем старые .pkl
             saved_odom = data.get('odom_only_history')
             if saved_odom:
-                self.odom_only_history = deque(saved_odom, maxlen=1000)
+                self.odom_only_history = deque(saved_odom, maxlen=_HISTORY_MAXLEN)
                 self.odom_only_position = self.odom_only_history[-1]
 
         # Если scan matcher включён — сразу строим likelihood field, чтобы

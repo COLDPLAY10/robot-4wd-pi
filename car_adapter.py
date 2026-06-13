@@ -182,6 +182,18 @@ def move_diagonal_right_back(speed):
     bot.Ctrl_Muto(2, r1 + 0)
     bot.Ctrl_Muto(3, r2 + 0)
     
+#танковое управление: левый и правый борт независимо, со знаком (-255..255)
+#нужно DWA: он выдаёт непрерывные (v, omega), которые сводятся к скоростям бортов
+
+def move_tank(left_speed, right_speed):
+    l = _clamp_pwm(left_speed)
+    r = _clamp_pwm(right_speed)
+    # моторы 0,1 — левый борт; 2,3 — правый (знаки сверены с rotate_left/forward)
+    bot.Ctrl_Muto(0, l)
+    bot.Ctrl_Muto(1, l)
+    bot.Ctrl_Muto(2, r)
+    bot.Ctrl_Muto(3, r)
+
 #остановка робота
 
 def stop_robot():
@@ -208,10 +220,12 @@ def set_deflection(speed, deflection):
     rad2deg = math.pi / 180
     vx = speed * math.cos(deflection * rad2deg)
     vy = speed * math.sin(deflection * rad2deg)
-    l1 = int(vy + vx) 
-    l2 = int(vy - vx)
-    r1 = int(vy - vx)
-    r2 = int(vy + vx)
+    # round, не усечение: cos(90°) в float не ноль, int() давал борта 30/29
+    # (паразитный страйф-компонент) и асимметрию ±1 PWM в поворотах
+    l1 = int(round(vy + vx))
+    l2 = int(round(vy - vx))
+    r1 = int(round(vy - vx))
+    r2 = int(round(vy + vx))
     return l1,l2,r1,r2
     
 #расчёт для компенсации скольжения

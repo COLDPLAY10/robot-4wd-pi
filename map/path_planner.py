@@ -71,17 +71,20 @@ class PathPlanner:
         self.map = occupancy_map
         self.current_global_path = []
 
-        # Параметры DWA
-        self.max_speed = 0.3        # м/с
+        # Параметры DWA (реальные пределы прокидывает NavigationController —
+        # single source of truth по скоростям там)
+        self.max_speed = 0.15       # м/с
         self.min_speed = 0.0
-        self.max_yaw_rate = 1.0     # рад/с
-        self.max_accel = 0.5        # м/с²
-        self.max_delta_yaw_rate = 1.5  # рад/с²
-        self.dt = 0.1               # шаг симуляции
-        self.predict_time = 2.0     # время предсказания
+        self.max_yaw_rate = 1.2     # рад/с
+        self.max_accel = 0.4        # м/с²
+        self.max_delta_yaw_rate = 2.0  # рад/с²
+        self.dt = 0.15              # шаг симуляции траектории
+        self.predict_time = 2.2     # горизонт предсказания, с
+        self.window_dt = 0.3        # «ширина» динамического окна по времени
 
         # Веса для DWA
-        self.heading_weight = 1.0   # вес направления к цели
+        self.heading_weight = 1.0   # вес прогресса к цели
+        self.align_weight = 0.8     # вес ориентации на цель в конце дуги
         self.clearance_weight = 0.5 # вес удаления от препятствий
         self.velocity_weight = 0.3  # вес скорости
 
@@ -92,6 +95,9 @@ class PathPlanner:
         self.occupied_threshold = occupied_threshold
         self.inflation_refresh_seconds = inflation_refresh_seconds
         self._inflated_grid: Optional[np.ndarray] = None
+        # Поле расстояний до ближайшего препятствия (м) — clearance для DWA
+        # за O(1) на точку вместо лучевого сканирования карты.
+        self._clearance_field: Optional[np.ndarray] = None
         self._inflation_built_at: float = 0.0
 
         print(f"[PathPlanner] Инициализирован "
@@ -120,6 +126,20 @@ class PathPlanner:
             inflated = _binary_dilate_numpy(occupied.astype(bool), radius_px).astype(np.uint8)
 
         self._inflated_grid = inflated
+
+        # Поле расстояний от СЫРЫХ препятствий (не inflated) — clearance-метрика
+        # DWA. Если препятствий нет, поле не нужно.
+        if occupied.any():
+            binary = np.where(occupied > 0, 0, 255).astype(np.uint8)
+            if _HAS_CV2:
+                dist_px = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+            else:
+                from .scan_matcher import _distance_transform_numpy
+                dist_px = _distance_transform_numpy(binary)
+            self._clearance_field = dist_px.astype(np.float32) * self.map.resolution
+        else:
+            self._clearance_field = None
+
         self._inflation_built_at = now
 
     def _is_blocked(self, gx: int, gy: int) -> bool:
@@ -185,51 +205,135 @@ class PathPlanner:
 
     def compute_velocity_command(self, current_pose: Tuple[float, float, float],
                                  current_vel: Tuple[float, float],
-                                 goal: Tuple[float, float]) -> Tuple[float, float]:
+                                 goal: Tuple[float, float],
+                                 v_max_cap: Optional[float] = None) -> Tuple[float, float]:
         """
-        Вычисление команд управления с помощью DWA
+        Локальный планировщик DWA: выбрать (v, omega) на ближайший такт.
+
+        Векторизованная реализация: все кандидаты окна симулируются разом
+        закрытой формой дуги, коллизии — по inflated grid (размер робота уже
+        учтён в раздувании), clearance — по полю расстояний за O(1) на точку.
+        На Pi укладывается в единицы миллисекунд — пригодно для вызова на
+        каждом тике контура (10–20 Гц).
 
         Args:
             current_pose: (x, y, theta)
-            current_vel: (v, omega) - линейная и угловая скорость
-            goal: целевая точка (x, y)
+            current_vel: (v, omega) — текущая (последняя командованная) скорость
+            goal: целевая точка (x, y) — обычно текущий waypoint A*
+            v_max_cap: реактивное ограничение скорости сверху (м/с) — например,
+                       по фронтальной дистанции sensor fusion; None = без капа
 
         Returns:
-            (v, omega) - оптимальная линейная и угловая скорость
+            (v, omega) — лучшая пара; (0, 0) если ни одна траектория не проходит
+            (всё в коллизии) — вызывающий обязан трактовать это как «стоп».
         """
-        # Свежий inflated grid перед оценкой траекторий
+        # Свежий inflated grid + clearance field перед оценкой траекторий
         self._ensure_inflation()
+        if self._inflated_grid is None:
+            return 0.0, 0.0
 
-        # Динамическое окно возможных скоростей
-        dw = self._calculate_dynamic_window(current_vel)
+        x0, y0, th0 = current_pose
+        v0, w0 = current_vel
 
-        # Оцениваем все возможные траектории
-        best_v = 0.0
-        best_omega = 0.0
-        best_score = -float('inf')
+        # --- Динамическое окно: достижимые скорости с учётом ускорений ---
+        v_lo = max(self.min_speed, v0 - self.max_accel * self.window_dt)
+        v_hi = min(self.max_speed, v0 + self.max_accel * self.window_dt)
+        if v_max_cap is not None:
+            v_hi = min(v_hi, max(0.0, v_max_cap))
+            v_lo = min(v_lo, v_hi)
+        w_lo = max(-self.max_yaw_rate, w0 - self.max_delta_yaw_rate * self.window_dt)
+        w_hi = min(self.max_yaw_rate, w0 + self.max_delta_yaw_rate * self.window_dt)
 
-        # Шаги для поиска
-        v_samples = np.linspace(dw[0], dw[1], 10)
-        omega_samples = np.linspace(dw[2], dw[3], 15)
+        V, W = np.meshgrid(np.linspace(v_lo, v_hi, 7),
+                           np.linspace(w_lo, w_hi, 13))
+        V = V.ravel().astype(np.float32)   # M кандидатов
+        W = W.ravel().astype(np.float32)
 
-        for v in v_samples:
-            for omega in omega_samples:
-                # Симуляция траектории
-                trajectory = self._predict_trajectory(current_pose, v, omega)
+        # --- Траектории закрытой формой: матрица (M, N) точек дуг ---
+        n_steps = max(2, int(self.predict_time / self.dt))
+        t = (np.arange(1, n_steps + 1, dtype=np.float32) * self.dt)[None, :]
+        Vc = V[:, None]
+        Wc = W[:, None]
+        w_safe = np.where(np.abs(Wc) < 1e-6, 1e-6, Wc)
+        th = th0 + Wc * t
+        arc_x = x0 + Vc / w_safe * (np.sin(th) - np.sin(th0))
+        arc_y = y0 - Vc / w_safe * (np.cos(th) - np.cos(th0))
+        lin_x = x0 + Vc * t * np.cos(th0)
+        lin_y = y0 + Vc * t * np.sin(th0)
+        straight = np.abs(Wc) < 1e-6
+        X = np.where(straight, lin_x, arc_x)
+        Y = np.where(straight, lin_y, arc_y)
 
-                # Проверка на столкновения
-                if self._check_collision(trajectory):
-                    continue
+        # --- Коллизии: по НЕПРЕРЫВНОМУ полю расстояний, не по бинарной решётке ---
+        # Бинарный inflated grid у границ хрупок: ceil радиуса в пикселях
+        # завышает раздувание почти на клетку, и робот, легально стоящий у
+        # границы (шум позы на железе!), видит «коллизию» в первой же точке
+        # любой дуги → вечный (0,0)-дедлок. Поэтому DWA проверяет точки по
+        # полю расстояний: запрещено всё ближе radius_total к препятствию,
+        # НО не дальше, чем робот уже находится (escape-правило: из «тесного»
+        # места можно выскальзывать вдоль границы, нельзя углубляться). Тот же
+        # принцип, что allow_inflated у стартовой точки A*.
+        gx = (X / self.map.resolution + self.map.origin_x).astype(np.int32)
+        gy = (Y / self.map.resolution + self.map.origin_y).astype(np.int32)
+        inside = ((gx >= 0) & (gx < self.map.width)
+                  & (gy >= 0) & (gy < self.map.height))
+        blocked = np.ones(X.shape, dtype=bool)  # вне карты = заблокировано
 
-                # Оценка траектории
-                score = self._evaluate_trajectory(trajectory, goal, v)
+        if self._clearance_field is None:
+            # Препятствий на карте нет вообще
+            blocked[inside] = False
+        else:
+            radius_total = self.robot_radius + self.inflation_margin
+            rgx, rgy = self.map.world_to_grid(x0, y0)
+            if 0 <= rgx < self.map.width and 0 <= rgy < self.map.height:
+                clear_here = float(self._clearance_field[rgy, rgx])
+            else:
+                clear_here = radius_total
+            # Смягчённый порог действует только на НАЧАЛЬНОМ участке дуги
+            # (не больше половины горизонта — иначе при коротком горизонте
+            # 0.35 м «окно» 0.4 м покрывало всю дугу и робот мог легально
+            # ползти впритирку к стене бесконечно). Достаточно, чтобы
+            # выскользнуть из тесного места; дальше — полный клиренс
+            # (боковое касание реактивный слой не страхует).
+            low_thr = min(radius_total, clear_here)
+            escape_len = min(0.4, 0.5 * self.max_speed * self.predict_time)
+            dist_along = Vc * t  # (M, N): пройденный путь вдоль дуги
+            threshold = np.where(dist_along <= escape_len, low_thr, radius_total)
+            blocked[inside] = (self._clearance_field[gy[inside], gx[inside]]
+                               < threshold[inside] - 1e-6)
 
-                if score > best_score:
-                    best_score = score
-                    best_v = v
-                    best_omega = omega
+        feasible = ~blocked.any(axis=1)
+        if not feasible.any():
+            return 0.0, 0.0
 
-        return best_v, best_omega
+        # --- Clearance: минимум поля расстояний вдоль дуги, насыщение 0.5 м ---
+        if self._clearance_field is not None:
+            cf = np.zeros(X.shape, dtype=np.float32)
+            cf[inside] = self._clearance_field[gy[inside], gx[inside]]
+            clearance_score = np.clip(cf.min(axis=1) / 0.5, 0.0, 1.0)
+        else:
+            clearance_score = np.ones(len(V), dtype=np.float32)
+
+        # --- Прогресс к цели + ориентация на цель в конце дуги ---
+        dist_now = float(np.hypot(goal[0] - x0, goal[1] - y0))
+        ex, ey, eth = X[:, -1], Y[:, -1], th[:, -1]
+        dist_end = np.hypot(goal[0] - ex, goal[1] - ey)
+        progress = np.clip(
+            (dist_now - dist_end) / max(1e-6, self.max_speed * self.predict_time),
+            -1.0, 1.0)
+        ang_err = np.arctan2(goal[1] - ey, goal[0] - ex) - eth
+        ang_err = np.abs(np.arctan2(np.sin(ang_err), np.cos(ang_err)))
+        align = (np.pi - ang_err) / np.pi
+        velocity_score = V / max(1e-6, self.max_speed)
+
+        total = (self.heading_weight * progress
+                 + self.align_weight * align
+                 + self.clearance_weight * clearance_score
+                 + self.velocity_weight * velocity_score)
+        total[~feasible] = -np.inf
+
+        best = int(np.argmax(total))
+        return float(V[best]), float(W[best])
 
     def _astar(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[Tuple[int, int]]:
         """A* алгоритм поиска пути"""
@@ -289,166 +393,43 @@ class PathPlanner:
 
         return []  # Путь не найден
 
-    def _calculate_dynamic_window(self, current_vel: Tuple[float, float]) -> Tuple[float, float, float, float]:
+    def _simplify_path(self, path: List[PathPoint]) -> List[PathPoint]:
         """
-        Вычисление динамического окна возможных скоростей
+        Упрощение пути методом line-of-sight («натяжение нити»): от текущей
+        точки тянем прямой сегмент к самой дальней точке пути, до которой он
+        проходит по СВОБОДНЫМ клеткам inflated grid, — она становится
+        следующим waypoint'ом.
 
-        Returns:
-            (v_min, v_max, omega_min, omega_max)
-        """
-        v, omega = current_vel
-
-        # Ограничения по ускорению
-        v_min = max(self.min_speed, v - self.max_accel * self.dt)
-        v_max = min(self.max_speed, v + self.max_accel * self.dt)
-
-        omega_min = max(-self.max_yaw_rate, omega - self.max_delta_yaw_rate * self.dt)
-        omega_max = min(self.max_yaw_rate, omega + self.max_delta_yaw_rate * self.dt)
-
-        return v_min, v_max, omega_min, omega_max
-
-    def _predict_trajectory(self, pose: Tuple[float, float, float],
-                           v: float, omega: float) -> List[Tuple[float, float, float]]:
-        """
-        Предсказание траектории робота
-
-        Args:
-            pose: (x, y, theta)
-            v: линейная скорость
-            omega: угловая скорость
-
-        Returns:
-            список точек (x, y, theta)
-        """
-        trajectory = []
-        x, y, theta = pose
-
-        num_steps = int(self.predict_time / self.dt)
-
-        for _ in range(num_steps):
-            x += v * np.cos(theta) * self.dt
-            y += v * np.sin(theta) * self.dt
-            theta += omega * self.dt
-            trajectory.append((x, y, theta))
-
-        return trajectory
-
-    def _check_collision(self, trajectory: List[Tuple[float, float, float]]) -> bool:
-        """
-        Проверка траектории на столкновения через inflated grid.
-
-        Размер робота уже учтён в inflation, поэтому достаточно проверить
-        попадает ли центр робота в inflated-клетку — никаких 8 точек по кругу.
-
-        Returns:
-            True если есть столкновение
-        """
-        if self._inflated_grid is None:
-            # Дефолтный путь без inflation (на всякий случай)
-            return any(self.map.is_occupied(x, y, threshold=50) for x, y, _ in trajectory)
-
-        for x, y, _ in trajectory:
-            gx, gy = self.map.world_to_grid(x, y)
-            if self._is_blocked(gx, gy):
-                return True
-        return False
-
-    def _evaluate_trajectory(self, trajectory: List[Tuple[float, float, float]],
-                            goal: Tuple[float, float], velocity: float) -> float:
-        """
-        Оценка качества траектории
-
-        Args:
-            trajectory: список точек
-            goal: целевая точка
-            velocity: скорость движения
-
-        Returns:
-            оценка (чем выше, тем лучше)
-        """
-        if not trajectory:
-            return -float('inf')
-
-        # Последняя точка траектории
-        end_x, end_y, end_theta = trajectory[-1]
-
-        # 1. Оценка направления к цели
-        dist_to_goal = np.sqrt((goal[0] - end_x)**2 + (goal[1] - end_y)**2)
-        heading_score = -dist_to_goal  # чем ближе к цели, тем лучше
-
-        # 2. Оценка удаления от препятствий
-        clearance_score = self._calculate_clearance(trajectory)
-
-        # 3. Оценка скорости (предпочитаем большую скорость)
-        velocity_score = velocity / self.max_speed
-
-        # Итоговая оценка
-        total_score = (self.heading_weight * heading_score +
-                      self.clearance_weight * clearance_score +
-                      self.velocity_weight * velocity_score)
-
-        return total_score
-
-    def _calculate_clearance(self, trajectory: List[Tuple[float, float, float]]) -> float:
-        """Вычисление минимального расстояния до препятствий вдоль траектории"""
-        min_clearance = float('inf')
-
-        for x, y, _ in trajectory:
-            # Проверяем расстояние до ближайшего препятствия
-            clearance = self._distance_to_nearest_obstacle(x, y)
-            min_clearance = min(min_clearance, clearance)
-
-        # Нормализуем (максимум 2 метра)
-        return min(min_clearance / 2.0, 1.0)
-
-    def _distance_to_nearest_obstacle(self, x: float, y: float) -> float:
-        """Расстояние до ближайшего препятствия"""
-        search_radius = 2.0
-        num_samples = 16
-
-        min_dist = search_radius
-
-        for i in range(num_samples):
-            angle = 2 * np.pi * i / num_samples
-            for r in np.linspace(0.1, search_radius, 10):
-                check_x = x + r * np.cos(angle)
-                check_y = y + r * np.sin(angle)
-
-                if self.map.is_occupied(check_x, check_y):
-                    min_dist = min(min_dist, r)
-                    break
-
-        return min_dist
-
-    def _simplify_path(self, path: List[PathPoint], epsilon: float = 0.1) -> List[PathPoint]:
-        """
-        Упрощение пути (удаление лишних точек)
-        Используется алгоритм Ramer-Douglas-Peucker
+        Прежняя реализация (проверка отклонения точки от хорды к СОСЕДНЕЙ
+        точке) была сломана: отклонение от хорды до соседа всегда меньше
+        клетки, поэтому ЛЮБОЙ путь схлопывался в прямую «старт-финиш» — даже
+        сквозь стены. LOS-вариант гарантирует, что каждый сегмент проходим.
         """
         if len(path) < 3:
             return path
 
-        # Простое упрощение: удаляем точки на прямых участках
         simplified = [path[0]]
-
-        for i in range(1, len(path) - 1):
-            prev = simplified[-1]
-            curr = path[i]
-            next_p = path[i + 1]
-
-            # Проверяем, лежат ли точки примерно на одной прямой
-            dist_to_line = self._point_to_line_distance(
-                (curr.x, curr.y),
-                (prev.x, prev.y),
-                (next_p.x, next_p.y)
-            )
-
-            if dist_to_line > epsilon:
-                simplified.append(curr)
-
-        simplified.append(path[-1])
-
+        i = 0
+        last = len(path) - 1
+        while i < last:
+            j = last
+            while j > i + 1 and not self._segment_free(path[i], path[j]):
+                j -= 1
+            simplified.append(path[j])
+            i = j
         return simplified
+
+    def _segment_free(self, a: PathPoint, b: PathPoint) -> bool:
+        """Проходит ли отрезок a→b целиком по свободным клеткам inflated grid."""
+        dist = float(np.hypot(b.x - a.x, b.y - a.y))
+        n = max(2, int(dist / (self.map.resolution * 0.5)))
+        for k in range(n + 1):
+            t = k / n
+            gx, gy = self.map.world_to_grid(a.x + t * (b.x - a.x),
+                                            a.y + t * (b.y - a.y))
+            if self._is_blocked(gx, gy):
+                return False
+        return True
 
     def _is_valid_grid_point(self, point: Tuple[int, int],
                              allow_inflated: bool = False) -> bool:
@@ -475,27 +456,4 @@ class PathPlanner:
             # чтобы тесты вне планировщика работали как раньше.
             return self.map.grid[gy, gx] < 70
         return not bool(self._inflated_grid[gy, gx])
-
-    @staticmethod
-    def _point_to_line_distance(point, line_start, line_end):
-        """Расстояние от точки до прямой"""
-        px, py = point
-        x1, y1 = line_start
-        x2, y2 = line_end
-
-        # Вектор прямой
-        dx = x2 - x1
-        dy = y2 - y1
-
-        if dx == 0 and dy == 0:
-            return np.sqrt((px - x1)**2 + (py - y1)**2)
-
-        # Проекция точки на прямую
-        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
-
-        # Ближайшая точка на отрезке
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-
-        return np.sqrt((px - closest_x)**2 + (py - closest_y)**2)
 
