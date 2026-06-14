@@ -19,6 +19,7 @@ import car_adapter as ca
 from map.slam_core import SLAM, Position
 from map.sensor_fusion import SensorFusion
 from map.path_planner import PathPlanner, PathPoint
+from map.sensor_recorder import SensorRecorder
 
 
 class NavigationMode(Enum):
@@ -123,6 +124,25 @@ class NavigationController:
         self.use_camera = use_camera
         self.use_ultrasonic = use_ultrasonic
         self.mapping_mode = mapping_mode
+
+        # Все результаты этого запуска — в одну подпапку по времени старта:
+        # results/<запуск>/{maps,depth,segmentation}/. Единый источник правды по
+        # путям; каталоги создаются лениво при первой записи (пустой запуск не
+        # плодит папок). save_map кладёт сюда карты, отладка камеры — в depth/,
+        # захваты/overlay сегментации — в segmentation/.
+        self.run_stamp = time.strftime('%Y%m%d-%H%M%S')
+        self.run_dir = os.path.join(self.RESULTS_DIR, self.run_stamp)
+        self.maps_dir = os.path.join(self.run_dir, 'maps')
+        self.depth_debug_dir = os.path.join(self.run_dir, 'depth')
+        self.seg_dir = os.path.join(self.run_dir, 'segmentation')
+        print(f"[NavController] Результаты запуска: {self.run_dir}")
+
+        # Рекордер сырых данных сенсоров → results/<запуск>/sensors/. Пишет в
+        # фоне, на контур не влияет; файлы создаются лениво при первом событии.
+        self.sensors_dir = os.path.join(self.run_dir, 'sensors')
+        self.recorder = SensorRecorder(self.sensors_dir,
+                                       enabled=self.SENSOR_RECORD_ENABLED)
+        self.recorder.start()
 
         # Инициализация компонентов.
         # WHEEL_BASE прокидываем в SLAM явно — single source of truth, иначе
@@ -259,17 +279,13 @@ class NavigationController:
     CAMERA_REACTIVE_ENABLED = True
     CAMERA_REACTIVE_MIN_RANGE_M = 0.12  # шумовой порог: ближе игнорируем (артефакты)
     # --- Отладка камеры: сохранение кадров с маской нейронки ---
-    # При включении раз в CAMERA_DEBUG_PERIOD_S в camera_debug/ пишется JPEG:
-    # слева исходный кадр, справа depth-цветом с красной маской препятствий
+    # При включении раз в CAMERA_DEBUG_PERIOD_S в results/<запуск>/depth/ пишется
+    # JPEG: слева исходный кадр, справа depth-цветом с красной маской препятствий
     # (те пиксели, что реально пошли в карту/реактив) и секторными дистанциями.
     # Включать на время отладки: каждый кадр — лишние ~50-100 мс на Pi.
     CAMERA_DEBUG_SAVE_ENABLED = False
     CAMERA_DEBUG_PERIOD_S = 3.0
     CAMERA_DEBUG_KEEP = 200        # сколько последних кадров хранить
-    CAMERA_DEBUG_DIR = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        'camera_debug',
-    )
     # Минимальный период между инференсами глубины (сек) — темп фонового
     # потока _DepthWorker. Инференс на Pi занимает 0.3–3 с; контур управления
     # он не блокирует (поток), но CPU делит с остальными — 0.7 с не даёт
@@ -280,6 +296,52 @@ class NavigationController:
     DEPTH_MODEL_PATH = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         'models', 'depth_anything_v2_small.onnx',
+    )
+
+    # ===== Каталог результатов: всё пишется в results/<запуск>/ =====
+    # Один запуск контроллера = одна подпапка по времени старта, внутри:
+    #   maps/         — карты .pkl + .png (см. save_map),
+    #   depth/        — отладочные кадры depth-восприятия,
+    #   segmentation/ — сырые захваты (cap_*) и overlay сегментации (floor_*).
+    # Конкретные пути на запуск считаются в __init__ (self.run_dir/maps_dir/...);
+    # здесь только корень. Каталоги создаются лениво, при первой записи.
+    RESULTS_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'results',
+    )
+
+    # Запись сырых данных сенсоров (lidar raw+scan, УЗ, команды (v,ω,dt), поза,
+    # отметки камеры) в results/<запуск>/sensors/ для офлайн-реплея и будущих
+    # тестов. ВКЛЮЧЕНА по умолчанию; пишет в фоне (map/sensor_recorder.py), на
+    # контур управления не влияет. Сырые байты лидара — для тестов парсера.
+    SENSOR_RECORD_ENABLED = True
+
+    # ===== Сегментация пола (SegFormer-B0) — ОТДЕЛЬНЫЙ канал =====
+    # Вторая нейросеть поверх Depth-Anything. На АЛГОРИТМ навигации не влияет: в
+    # карту и реактивный слой ничего не пишет (это будущий этап). Сейчас лишь
+    # копит сырые кадры для офлайн-разбора. Захваты/overlay пишутся в
+    # results/<запуск>/segmentation/ — отдельно от depth-отладки (results/.../depth/).
+    # Основной сценарий — офлайн: снять кадры заездом, прогнать на дев-машине
+    # scripts/eval_floor_segmentation.py.
+    #
+    #  FLOOR_SEG_CAPTURE_RAW — дёшево писать СЫРЫЕ кадры (RGB[+глубина]) в
+    #    results/<запуск>/segmentation/ для офлайн-оценки; модель на роботе НЕ нужна.
+    #    ВКЛЮЧЕНО уже сейчас — данные копятся с каждого заезда (на навигацию не
+    #    влияет: только запись файла раз в FLOOR_SEG_PERIOD_S секунд).
+    #  FLOOR_SEG_ENABLED — гонять SegFormer + калибровку прямо на роботе (тяжело,
+    #    уполовинит FPS depth; нужен models/segformer_b0_ade.onnx). В карту/реактив
+    #    НЕ пишет — только overlay в ту же segmentation/ (запись в карту — отдельный
+    #    будущий этап: нужен правильный depth-based контракт; старый наивный метод
+    #    update_with_camera_segmentation был баговый и удалён).
+    FLOOR_SEG_CAPTURE_RAW = True
+    FLOOR_SEG_CAPTURE_DEPTH = True   # рядом с RGB класть глубину (.npy float16) —
+                                     # она уже посчитана depth-потоком, офлайн не пересчитывать
+    FLOOR_SEG_ENABLED = False
+    FLOOR_SEG_PERIOD_S = 2.0         # как часто захватывать/сегментировать, сек
+    FLOOR_SEG_KEEP = 1000            # хранить столько последних кадров (данных лучше много)
+    FLOOR_SEG_MODEL_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        'models', 'segformer_b0_ade.onnx',
     )
 
     def _init_camera_servos(self):
@@ -356,7 +418,7 @@ class NavigationController:
     def _save_camera_debug_frame(self, frame, depth, pose, cam_dists):
         """
         Сохранить отладочный кадр (RGB | depth + маска препятствий) в
-        camera_debug/, не чаще CAMERA_DEBUG_PERIOD_S. Старые кадры сверх
+        results/<запуск>/depth/, не чаще CAMERA_DEBUG_PERIOD_S. Старые кадры сверх
         CAMERA_DEBUG_KEEP удаляются, чтобы не забить SD-карту.
         """
         now = time.time()
@@ -377,19 +439,97 @@ class NavigationController:
         if img is None:
             return
 
-        os.makedirs(self.CAMERA_DEBUG_DIR, exist_ok=True)
+        os.makedirs(self.depth_debug_dir, exist_ok=True)
         fname = time.strftime('debug_%Y%m%d_%H%M%S') + f"_{int(now * 1000) % 1000:03d}.jpg"
-        cv2.imwrite(os.path.join(self.CAMERA_DEBUG_DIR, fname), img,
+        cv2.imwrite(os.path.join(self.depth_debug_dir, fname), img,
                     [cv2.IMWRITE_JPEG_QUALITY, 85])
 
         # Ротация: держим только последние CAMERA_DEBUG_KEEP кадров
         try:
-            files = sorted(f for f in os.listdir(self.CAMERA_DEBUG_DIR)
+            files = sorted(f for f in os.listdir(self.depth_debug_dir)
                            if f.startswith('debug_') and f.endswith('.jpg'))
             for old in files[:-self.CAMERA_DEBUG_KEEP]:
-                os.remove(os.path.join(self.CAMERA_DEBUG_DIR, old))
+                os.remove(os.path.join(self.depth_debug_dir, old))
         except OSError:
             pass
+
+    def _rotate_dir(self, directory: str, prefix: str, keep: int):
+        """Оставить в каталоге только `keep` последних файлов с данным префиксом."""
+        try:
+            files = sorted(f for f in os.listdir(directory) if f.startswith(prefix))
+            for old in files[:-keep]:
+                try:
+                    os.remove(os.path.join(directory, old))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _maybe_floor_segmentation(self, frame, depth):
+        """
+        Сегментация пола (SegFormer) — ОТДЕЛЬНЫЙ канал, на алгоритм навигации не
+        влияет. Карту и реактивный слой НЕ трогает, depth-отладку
+        (results/<запуск>/depth/) тоже. Если оба флага False — мгновенный выход.
+
+          FLOOR_SEG_CAPTURE_RAW — сохранить сырой кадр (+глубину) для офлайн-оценки;
+                                  модель на роботе не нужна.
+          FLOOR_SEG_ENABLED     — прогнать SegFormer + калибровку на роботе и
+                                  сохранить overlay (в карту НЕ пишем).
+        """
+        if not (self.FLOOR_SEG_CAPTURE_RAW or self.FLOOR_SEG_ENABLED):
+            return
+        now = time.time()
+        if now - getattr(self, '_last_floor_seg_time', 0.0) < self.FLOOR_SEG_PERIOD_S:
+            return
+        self._last_floor_seg_time = now
+
+        import cv2  # на роботе есть (используется камерой)
+        ts = time.strftime('%Y%m%d_%H%M%S') + f"_{int(now * 1000) % 1000:03d}"
+
+        # 1) Сырой захват для офлайн-оценки — дёшево, модель на роботе не нужна.
+        if self.FLOOR_SEG_CAPTURE_RAW:
+            try:
+                os.makedirs(self.seg_dir, exist_ok=True)
+                jpg_name = f'cap_{ts}.jpg'
+                cv2.imwrite(os.path.join(self.seg_dir, jpg_name),
+                            frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                npy_name = None
+                if self.FLOOR_SEG_CAPTURE_DEPTH and depth is not None:
+                    # float16: глубина уже посчитана depth-потоком — офлайн не пересчитываем.
+                    npy_name = f'cap_{ts}.npy'
+                    np.save(os.path.join(self.seg_dir, npy_name),
+                            depth.astype(np.float16))
+                self._rotate_dir(self.seg_dir, 'cap_', self.FLOOR_SEG_KEEP)
+                # Лёгкая отметка кадра в единой шкале сенсоров (сам кадр — в segmentation/)
+                self.recorder.record_camera(time.time(), jpg_name, npy_name)
+            except Exception as e:
+                self._log_sensor_error('floor_seg_capture', e)
+
+        # 2) Боевой инференс на роботе (тяжело) — только overlay в лог, в карту НЕ пишем.
+        if self.FLOOR_SEG_ENABLED:
+            try:
+                if not hasattr(self, '_floor_segmenter'):
+                    from camera_segmentation import FloorSegmenter
+                    self._floor_segmenter = FloorSegmenter(
+                        model_path=self.FLOOR_SEG_MODEL_PATH)
+                mask = self._floor_segmenter.segment_floor(frame)
+                if mask is not None:
+                    from camera_segmentation import (estimate_floor_plane,
+                                                     render_floor_debug)
+                    cal = estimate_floor_plane(depth, mask, self.camera_intrinsics,
+                                               pixel_stride=self.CAMERA_PIXEL_STRIDE)
+                    if cal is not None and cal.ok:
+                        print(f"[FloorSeg] tilt={cal.tilt_deg:+.1f}° "
+                              f"h={cal.height_m * 100:.1f}см inlier={cal.inlier_ratio:.2f}")
+                    os.makedirs(self.seg_dir, exist_ok=True)
+                    overlay = render_floor_debug(frame, mask, cal)
+                    if overlay is not None:
+                        cv2.imwrite(os.path.join(self.seg_dir, f'floor_{ts}.jpg'),
+                                    overlay, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                        self._rotate_dir(self.seg_dir, 'floor_',
+                                         self.FLOOR_SEG_KEEP)
+            except Exception as e:
+                self._log_sensor_error('floor_seg', e)
 
     def _init_sensors(self):
         """Инициализация датчиков"""
@@ -450,6 +590,8 @@ class NavigationController:
                   if self.lidar.packet_count > 0:
                       print(f"[NavController] Лидар подключен на {port} @ {baud} "
                             f"(принято фреймов: {self.lidar.packet_count})")
+                      # Отвод сырых байтов в рекордер (для тестов парсера)
+                      self.lidar.set_raw_sink(self.recorder.record_lidar_raw)
                       return
 
                   print(f"[NavController] {port} @ {baud}: валидных фреймов лидара нет")
@@ -630,6 +772,10 @@ class NavigationController:
                     if self.CAMERA_DEBUG_SAVE_ENABLED:
                         self._save_camera_debug_frame(
                             frame, depth, pose, cam_dists)
+                    # Сегментация пола (SegFormer) — отдельный канал, по
+                    # умолчанию выключен (оба флага False → мгновенный выход),
+                    # существующее логирование не затрагивает.
+                    self._maybe_floor_segmentation(frame, depth)
             except Exception as e:
                 self._log_sensor_error('camera', e)
 
@@ -649,6 +795,11 @@ class NavigationController:
                     # размазываются на 5-15° — мажут карту и матчер).
                     rev = getattr(self.lidar, 'revolution_count', None)
                     is_new_rev = rev is None or rev != getattr(self, '_last_lidar_rev', None)
+                    # Рекордер: парсенный скан на КАЖДЫЙ новый оборот (полнее
+                    # гейта SLAM ниже); сырые байты пишутся отдельно из потока лидара.
+                    if rev is not None and rev != getattr(self, '_last_recorded_rev', None):
+                        self._last_recorded_rev = rev
+                        self.recorder.record_lidar_scan(time.time(), rev, lidar_scan)
                     _, omega_now = self._commanded_velocity()
                     if is_new_rev and abs(omega_now) <= 0.6:
                         filtered_scan = [(a, d) for a, d in lidar_scan if d >= 0.12]
@@ -667,6 +818,7 @@ class NavigationController:
                 if distance_cm is not None and distance_cm > 0:
                     distance_m = distance_cm / 100.0
                     self.sensor_fusion.update_ultrasonic(distance_m)
+                    self.recorder.record_ultrasonic(time.time(), distance_m)
                     # В карту — не чаще 2 Гц: конус из 7 лучей каждым тиком
                     # насыщал дуги тем же показанием
                     now_us = time.time()
@@ -793,6 +945,12 @@ class NavigationController:
         # матчера систематически отстаёт на тик.
         self._update_odometry(dt)
         self._update_sensors()
+        # Команда/поза/dt — критично для достоверного реплея: scan matcher
+        # использует одометрический прайр между сканами.
+        v_cmd, omega_cmd = self._commanded_velocity()
+        pos = self.slam.current_position
+        self.recorder.record_command(now, v_cmd, omega_cmd, dt)
+        self.recorder.record_pose(now, pos.x, pos.y, pos.theta)
 
     def _set_movement_command(self, command: str, speed: int, steer: float = 0.0,
                               tank=(0, 0)):
@@ -1592,17 +1750,34 @@ class NavigationController:
             except Exception:
                 pass
 
-        # Освобождаем ресурсы камеры (legacy-сегментация)
-        if hasattr(self, 'camera_seg') and self.camera_seg is not None:
+        # Рекордер — последним: лидар и depth-поток уже остановлены, дописываем
+        # остаток очереди и закрываем файлы.
+        if getattr(self, 'recorder', None) is not None:
             try:
-                self.camera_seg.release()
-            except:
+                self.recorder.stop()
+                if self.recorder.dropped:
+                    print(f"[NavController] Рекордер: записано {self.recorder.written}, "
+                          f"отброшено {self.recorder.dropped} (очередь переполнялась)")
+            except Exception:
                 pass
 
-    def save_map(self, filename: str):
-        """Сохранение карты — inflation на PNG показываем тем же радиусом, который A* использует на самом деле."""
+    def save_map(self, filename: str) -> str:
+        """
+        Сохранение карты (.pkl + .png). inflation на PNG рисуем тем же радиусом,
+        который A* использует на самом деле.
+
+        Голое имя файла (без каталога) кладём в maps/ этого запуска
+        (results/<запуск>/maps/) — чтобы не сорить в текущей папке. Явный путь
+        (с каталогом) уважаем как есть. Загрузку (load_map / goto --map) это не
+        трогает: туда передаётся явный путь. Возвращаем фактический путь .pkl,
+        чтобы вызывающий код напечатал реальное местоположение.
+        """
+        if not os.path.dirname(filename):
+            os.makedirs(self.maps_dir, exist_ok=True)
+            filename = os.path.join(self.maps_dir, filename)
         self.slam.save_map(filename,
                            inflation_radius_m=self.ROBOT_RADIUS + self.SAFETY_MARGIN)
+        return filename
 
     def _make_path_planner(self) -> PathPlanner:
         """

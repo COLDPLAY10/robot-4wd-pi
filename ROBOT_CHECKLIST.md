@@ -102,8 +102,8 @@ cd map_scripts && python3 demo_with_lidar.py explore
    `Камера открыта: 640×480` и `[DepthEstimator] Загружено: …` —
    если этого нет, камера в навигации не участвует вовсе.
 2. Включить отладочные кадры: в `map/navigation_controller.py` выставить
-   `CAMERA_DEBUG_SAVE_ENABLED = True`. Раз в 3 с в `camera_debug/` пишется
-   JPEG: слева кадр, справа depth-цветом, красным — пиксели, реально
+   `CAMERA_DEBUG_SAVE_ENABLED = True`. Раз в 3 с в `results/<запуск>/depth/`
+   пишется JPEG: слева кадр, справа depth-цветом, красным — пиксели, реально
    ставшие препятствиями, сверху дистанции front/corridor/left/right.
    По этим кадрам видно, что камера видит и почему останавливается.
    После отладки выключить (кадры стоят ~50–100 мс на Pi).

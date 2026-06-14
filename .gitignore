@@ -62,6 +62,9 @@ map_scripts/map_*.png
 *.avi
 dataset/
 
+# Результаты запусков: карты, отладка глубины/сегментации (не в git)
+results/
+
 # OS
 .DS_Store
 Thumbs.db

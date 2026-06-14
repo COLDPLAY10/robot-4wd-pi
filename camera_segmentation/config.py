@@ -1,31 +1,20 @@
 """
-Конфигурация камеры и параметры сегментации
+Конфигурация нейросетевой сегментации пола (SegFormer-B0, ADE20K).
 """
 
-# Конфигурация камеры
-CAMERA_ID = 0
-FRAME_W = 640
-FRAME_H = 480
+import os
 
-# Классы сегментации
-CLASS_UNKNOWN = 0    # Неизвестно (по умолчанию)
-CLASS_FLOOR = 10     # Пол (свободное пространство)
-CLASS_OBSTACLE = 1   # Препятствие
-CLASS_WALL = 2       # Стена
-CLASS_MESH = 3       # Сетчатая конструкция
+# Путь к ONNX-модели (экспорт: scripts/setup_segformer_model.py).
+# Абсолютный относительно корня репо — иначе ломается при запуске из map_scripts/.
+SEGFORMER_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'models', 'segformer_b0_ade.onnx',
+)
 
-# Цвета для визуализации классов
-CLASS_COLORS = {
-    CLASS_UNKNOWN: (128, 128, 128),  # Серый
-    CLASS_FLOOR: (0, 255, 0),        # Зеленый
-    CLASS_OBSTACLE: (0, 0, 255),     # Красный
-    CLASS_WALL: (255, 0, 0),         # Синий
-    CLASS_MESH: (255, 255, 0)        # Голубой
-}
+# Размер входа модели (квадрат, как при обучении ade-512-512).
+SEGFORMER_INPUT_SIZE = 512
 
-# Параметры оценки расстояния
-MAX_DISTANCE_ESTIMATE = 3.0  # метров
-MIN_DISTANCE_ESTIMATE = 0.2  # метров
-CAMERA_FOV_DEG = 60.0        # угол обзора камеры
-
-
+# Индексы класса "пол" в ADE20K — ПРОВЕРЕНЫ через model.config.id2label
+# (scripts/setup_segformer_model.py): 3 = 'floor'. Ковёр (28 = 'rug') по умолчанию
+# НЕ считаем полом — добавьте 28, если робот ездит по ковровому покрытию.
+FLOOR_CLASS_IDS = (3,)

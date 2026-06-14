@@ -421,7 +421,7 @@ class SLAM:
         """
         Обновление карты препятствий из карты глубины (Depth-Anything-V2).
 
-        Заменяет старую update_with_camera_segmentation. Логика:
+        Логика:
           1. Обратная проекция пикселей глубины в мировые координаты.
           2. Фильтр по высоте: только точки на 3-50 см над полом считаются
              препятствиями для тележки.
@@ -517,66 +517,6 @@ class SLAM:
                                          occupied=False, confidence=0.3)
 
         return obstacles
-
-    def update_with_camera_segmentation(self, segmentation_mask: np.ndarray,
-                                       camera_fov: float = 60.0,
-                                       max_distance: float = 3.0):
-        """
-        DEPRECATED: семантическая сегментация "пол/стены" заменена depth-based
-        perception (update_with_camera_depth). Этот метод оставлен только для
-        обратной совместимости со старыми скриптами data_collector / тестами.
-
-        Args:
-            segmentation_mask: маска сегментации (H x W), где значения:
-                              0 - неизвестно, 1 - препятствие, 2 - стена, 3 - сетка, 10 - пол (свободно)
-            camera_fov: угол обзора камеры в градусах
-            max_distance: максимальная дальность проекции в метрах
-        """
-        if self.mapping_mode != 'mapping':
-            return  # в localization-режиме карта read-only
-        h, w = segmentation_mask.shape
-        fov_rad = np.deg2rad(camera_fov)
-
-        robot_x = self.current_position.x
-        robot_y = self.current_position.y
-        robot_theta = self.current_position.theta
-
-        # Проходим по колонкам изображения
-        for col in range(0, w, 5):  # шаг 5 для ускорения
-            # Угол луча относительно робота
-            angle_offset = (col / w - 0.5) * fov_rad
-            global_angle = robot_theta + angle_offset
-
-            # Ищем препятствие в колонке (снизу вверх)
-            obstacle_found = False
-            floor_found = False
-            distance_estimate = max_distance
-
-            for row in range(h - 1, h // 2, -1):  # нижняя половина изображения
-                val = segmentation_mask[row, col]
-
-                if val > 0 and val != 10:  # препятствие, стена или сетка (не пол=10 и не unknown=0)
-                    # Оценка расстояния по вертикальной позиции в кадре
-                    # Чем ниже в кадре, тем ближе
-                    distance_estimate = max_distance * (1.0 - (h - row) / (h / 2))
-                    distance_estimate = max(0.3, min(max_distance, distance_estimate))
-                    obstacle_found = True
-                    break
-                elif val == 10:  # пол
-                    floor_found = True
-
-            if obstacle_found:
-                # Координаты препятствия
-                obs_x = robot_x + distance_estimate * np.cos(global_angle)
-                obs_y = robot_y + distance_estimate * np.sin(global_angle)
-
-                self.map.update_cell(obs_x, obs_y, occupied=True, confidence=0.7)
-            elif floor_found:
-                # Свободное пространство — только если реально видим пол
-                for d in np.linspace(0.2, max_distance * 0.8, 5):
-                    free_x = robot_x + d * np.cos(global_angle)
-                    free_y = robot_y + d * np.sin(global_angle)
-                    self.map.update_cell(free_x, free_y, occupied=False, confidence=0.3)
 
     def add_landmark(self, x: float, y: float, feature_type: str, confidence: float = 1.0):
         """Добавление ориентира на карту"""

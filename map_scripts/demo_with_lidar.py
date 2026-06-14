@@ -101,10 +101,10 @@ def exploration_with_lidar_demo(map_file=None):
     finally:
         controller.stop()
         out_file = f"map_exploration_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(out_file)
-        print(f"\n[INFO] Карта сохранена: {out_file}")
+        saved = controller.save_map(out_file)
+        print(f"\n[INFO] Карта сохранена: {saved}")
         print(f"[INFO] Запуск навигации: "
-              f"python3 demo_with_lidar.py goto X Y --map {out_file}")
+              f"python3 demo_with_lidar.py goto X Y --map {saved}")
 
 
 def goto_with_lidar_demo(target_x: float, target_y: float, map_file: str):
@@ -150,8 +150,8 @@ def goto_with_lidar_demo(target_x: float, target_y: float, map_file: str):
         # В localization режиме мы не модифицируем карту, но сохраняем pkl
         # с обновлённой траекторией — это полезно для отчёта и отладки.
         out_file = f"trajectory_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(out_file)
-        print(f"\n[INFO] Траектория сохранена: {out_file}")
+        saved = controller.save_map(out_file)
+        print(f"\n[INFO] Траектория сохранена: {saved}")
 
 
 def main():

@@ -206,7 +206,8 @@ def interactive_mode(navigation_controller: NavigationController):
 
             elif command == 'save':
                 filename = cmd[1] if len(cmd) > 1 else "map_save.pkl"
-                navigation_controller.save_map(filename)
+                saved = navigation_controller.save_map(filename)
+                print(f"[INFO] Карта сохранена: {saved}")
 
             elif command == 'load':
                 filename = cmd[1] if len(cmd) > 1 else "map_save.pkl"
@@ -326,7 +327,8 @@ def main():
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             map_file = f"map_autosave_{timestamp}.pkl"
-            controller.save_map(map_file)
+            saved = controller.save_map(map_file)
+            print(f"[INFO] Карта сохранена: {saved}")
         except Exception as e:
             print(f"[WARN] Не удалось сохранить карту: {e}")
 

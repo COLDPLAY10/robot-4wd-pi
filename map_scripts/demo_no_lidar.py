@@ -81,10 +81,10 @@ def simple_exploration_demo():
 
         # Сохраняем карту
         map_file = f"map_demo_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(map_file)
+        saved = controller.save_map(map_file)
 
-        print(f"\n[INFO] Карта сохранена: {map_file}")
-        print("[INFO] Используйте: python3 visualize_map.py --map {map_file}")
+        print(f"\n[INFO] Карта сохранена: {saved}")
+        print(f"[INFO] Используйте: python3 visualize_map.py {saved}")
 
 
 def navigate_to_goal_demo(x, y):
@@ -142,7 +142,8 @@ def navigate_to_goal_demo(x, y):
 
         # Сохраняем карту
         map_file = f"map_navigation_{time.strftime('%Y%m%d_%H%M%S')}.pkl"
-        controller.save_map(map_file)
+        saved = controller.save_map(map_file)
+        print(f"\n[INFO] Карта сохранена: {saved}")
 
 
 def main():

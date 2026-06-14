@@ -88,6 +88,10 @@ class LidarDriver:
         self.bad_checksum_count = 0
         self.revolution_count = 0
 
+        # Опциональный «отвод» сырых байтов: если задан рекордер, поток чтения
+        # отдаёт ему (timestamp, chunk). None = ничего не пишем.
+        self._raw_sink = None
+
         # Авто-детект размера сэмпла (2 или 3 байта)
         self.sample_size: Optional[int] = None
         self._layout_votes = {2: 0, 3: 0}
@@ -152,6 +156,11 @@ class LidarDriver:
                 waiting = self.serial.in_waiting
                 chunk = self.serial.read(waiting if waiting else 1)
                 if chunk:
+                    if self._raw_sink is not None:
+                        try:
+                            self._raw_sink(time.time(), chunk)
+                        except Exception:
+                            pass  # запись логов не должна ронять чтение порта
                     buf.extend(chunk)
                     self._process_buffer(buf)
                 # Защита от разрастания при полной рассинхронизации
@@ -301,6 +310,10 @@ class LidarDriver:
                   f"битых CS: {self.bad_checksum_count}")
 
     # ------------------------------------------------------------ доступ к данным
+
+    def set_raw_sink(self, sink):
+        """Приёмник сырых байтов порта: sink(timestamp, chunk). None — выключить."""
+        self._raw_sink = sink
 
     def get_scan(self) -> List[Tuple[float, float]]:
         """
