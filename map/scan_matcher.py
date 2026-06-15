@@ -77,7 +77,7 @@ class HectorScanMatcher:
                  resolution: float,
                  occupied_threshold: float = 65.0,
                  known_threshold: float = 1.5,
-                 max_iters: int = 30,
+                 max_iters: int = 14,
                  convergence_tol: float = 1e-4,
                  field_refresh_seconds: float = 0.4,
                  match_acceptance_m: float = 0.18,
@@ -90,7 +90,11 @@ class HectorScanMatcher:
             occupied_threshold: значение 0..100, выше которого ячейка считается препятствием
             known_threshold: насколько ячейка должна отклоняться от 50 (prior), чтобы
                              считать её "виденной" — точки в незнакомые области выбрасываем
-            max_iters: максимум итераций Gauss-Newton
+            max_iters: максимум итераций Gauss-Newton. GN на likelihood field
+                       сходится за единицы итераций (есть convergence_tol —
+                       ранний выход). 14 вместо 30 срезает латентность тика: на
+                       плохих сканах матчер упирался в 30 итераций каждый оборот
+                       (~tens of ms на горячем пути), не улучшая результат
             convergence_tol: норма шага, после которой останавливаемся
             field_refresh_seconds: как часто пересчитывать distance transform
             match_acceptance_m: средняя дистанция точек скана до карты, выше — матч плохой

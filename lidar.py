@@ -62,10 +62,14 @@ class LidarDriver:
     # Угол установки лидара на роботе: на сколько градусов «ноль» лидара
     # повёрнут относительно «вперёд» робота (по данным лидара, до знака).
     ANGLE_OFFSET_DEG = 0.0
-    # Делитель сырой дистанции до миллиметров. None = авто по размеру сэмпла
-    # (2 байта → 4.0, X4-стиль; 3 байта → 1.0). Если тест у стены в 1 м
-    # показывает 4 м — поставить 4.0 явно; если 0.25 м — поставить 1.0.
-    DISTANCE_DIVISOR: Optional[float] = None
+    # Делитель сырой дистанции до миллиметров. None = авто по размеру сэмпла.
+    # ЭМПИРИЧЕСКИ (проверено на железе тестом у стены + по дампам лидара) на этом
+    # экземпляре T-mini Plus сырое значение идёт в 1/4 мм, поэтому верный делитель
+    # = 4 для ОБОИХ форматов сэмпла (и 2-байтного X4-стиля, и 3-байтного
+    # [intensity, dist_L, dist_H]). Старый авто-дефолт 1.0 для 3 байт завышал
+    # дистанции вчетверо (стена 1 м → 4 м) → робот не тормозил и бился об стены.
+    # Тест: робот носом к стене на 1.00 м, `python3 lidar.py`, медиана фронта ~1.0 м.
+    DISTANCE_DIVISOR: Optional[float] = 4
     # Валидный диапазон дистанций, м (T-mini Plus: 0.02–12 м по паспорту)
     MIN_RANGE_M = 0.02
     MAX_RANGE_M = 16.0
@@ -235,7 +239,9 @@ class LidarDriver:
         if self.sample_size is None and self._layout_votes[cand] >= 6:
             self.sample_size = cand
             if self.distance_divisor is None:
-                self.distance_divisor = 4.0 if cand == 2 else 1.0
+                # На этом T-mini Plus оба формата идут в 1/4 мм → делитель 4.0.
+                # (Раньше для 3 байт ставилось 1.0 — это и был баг 4× завышения.)
+                self.distance_divisor = 4.0
             print(f"[Lidar] Формат сэмпла определён: {cand} байт/точка, "
                   f"делитель дистанции {self.distance_divisor}")
         return cand
@@ -266,7 +272,9 @@ class LidarDriver:
         if span < 0:
             span += 360.0  # пакет через 0°
 
-        divisor = self.distance_divisor or (4.0 if size == 2 else 1.0)
+        # distance_divisor задан явно (DISTANCE_DIVISOR=4) или авто-детектом (4.0);
+        # запасной 4.0 — на случай первых пакетов до завершения авто-детекта.
+        divisor = self.distance_divisor or 4.0
 
         points = []
         for i in range(lsn):

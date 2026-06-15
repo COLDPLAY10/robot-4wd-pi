@@ -5,6 +5,7 @@
 """
 
 import threading
+import queue
 import time
 import numpy as np
 from enum import Enum
@@ -58,7 +59,8 @@ class _DepthWorker(threading.Thread):
         self._period_s = period_s
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
-        self._result = None  # (frame, depth, pose, timestamp)
+        self._result = None  # (frame, depth, pose, timestamp) — для SLAM/реактива
+        self._latest = None  # (frame_copy, pose, depth|None, ts) — для лога кадров
         self.inference_count = 0
 
     def run(self):
@@ -71,9 +73,16 @@ class _DepthWorker(threading.Thread):
                     self._stop_evt.wait(0.2)
                     continue
                 depth = self._estimator.get_depth_map(frame)
+                ts = time.time()
+                with self._lock:
+                    # Последний кадр доступен ВСЕГДА (даже когда инференс не дал
+                    # глубину) — нужен периодическому логгеру кадров. copy(): cv2
+                    # может переиспользовать буфер на следующем read(), а кадр
+                    # уходит в фоновую запись и живёт дольше этого такта.
+                    self._latest = (frame.copy(), pose, depth, ts)
+                    if depth is not None:
+                        self._result = (frame, depth, pose, ts)
                 if depth is not None:
-                    with self._lock:
-                        self._result = (frame, depth, pose, time.time())
                     self.inference_count += 1
             except Exception as e:
                 print(f"[DepthWorker] Ошибка: {type(e).__name__}: {e}")
@@ -90,8 +99,98 @@ class _DepthWorker(threading.Thread):
                 return self._result
         return None
 
+    def peek_frame(self):
+        """
+        Последний прочитанный кадр (frame, pose, depth|None, ts) — для лога.
+        Доступен, даже когда инференс глубины не дал результата (модель медленная
+        или недоступна): лог кадров не должен зависеть от глубины.
+        """
+        with self._lock:
+            return self._latest
+
     def stop(self, timeout: float = 2.0):
         self._stop_evt.set()
+        if self.is_alive():
+            self.join(timeout=timeout)
+
+
+class _ImageLogger(threading.Thread):
+    """
+    Фоновый писатель кадров камеры на диск (results/<запуск>/segmentation/).
+
+    Зачем поток: cv2.imwrite + np.save(~0.6 МБ) + ротация каталога — это десятки-
+    сотни мс на SD-карте. Раньше они шли СИНХРОННО в контуре управления
+    (_update_sensors), морозя робота на запись: пока пишется кадр, моторы в
+    круизе не остановлены и робот едет вслепую. Теперь главный цикл лишь кладёт
+    кадр в очередь, а диск трогает этот поток.
+
+    Запись надёжная и ГРОМКАЯ: первый успешный кадр и первая ошибка печатаются с
+    полным путём — если каталог недоступен, это видно сразу, а не теряется молча.
+    """
+
+    def __init__(self, keep: int, max_queue: int = 64):
+        super().__init__(daemon=True, name="image-logger")
+        self._q: "queue.Queue" = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._keep = keep
+        self._announced_ok = False
+        self._announced_err = False
+        self.written = 0
+        self.dropped = 0
+
+    def submit(self, out_dir: str, base: str, frame_bgr, depth):
+        """Неблокирующе: при переполнении очереди кадр отбрасывается (счётчик)."""
+        try:
+            self._q.put_nowait((out_dir, base, frame_bgr, depth))
+        except queue.Full:
+            self.dropped += 1
+
+    def run(self):
+        import cv2  # на роботе есть (используется камерой)
+        while True:
+            try:
+                out_dir, base, frame, depth = self._q.get(timeout=0.2)
+            except queue.Empty:
+                if self._stop.is_set():
+                    break
+                continue
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                jpg_path = os.path.join(out_dir, base + '.jpg')
+                if not cv2.imwrite(jpg_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+                    raise OSError(f"cv2.imwrite вернул False для {jpg_path}")
+                if depth is not None:
+                    np.save(os.path.join(out_dir, base + '.npy'),
+                            depth.astype(np.float16))
+                self.written += 1
+                if not self._announced_ok:
+                    self._announced_ok = True
+                    print(f"[ImageLogger] Кадры пишутся в {out_dir} "
+                          f"(первый: {base}.jpg)")
+                self._rotate(out_dir)
+            except Exception as e:
+                if not self._announced_err:
+                    self._announced_err = True
+                    print(f"[ImageLogger] !!! ОШИБКА записи кадра в {out_dir}: "
+                          f"{type(e).__name__}: {e}")
+
+    def _rotate(self, out_dir: str):
+        """Держим только `keep` последних кадров; .npy удаляем парно с .jpg."""
+        try:
+            jpgs = sorted(f for f in os.listdir(out_dir)
+                          if f.startswith('cap_') and f.endswith('.jpg'))
+            for old in jpgs[:-self._keep]:
+                stem = old[:-4]
+                for ext in ('.jpg', '.npy'):
+                    try:
+                        os.remove(os.path.join(out_dir, stem + ext))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    def stop(self, timeout: float = 3.0):
+        self._stop.set()
         if self.is_alive():
             self.join(timeout=timeout)
 
@@ -144,6 +243,11 @@ class NavigationController:
                                        enabled=self.SENSOR_RECORD_ENABLED)
         self.recorder.start()
 
+        # Фоновый лог кадров камеры → results/<запуск>/segmentation/. Каталог
+        # создаётся и проверяется на запись СРАЗУ (а не лениво в цикле): если
+        # путь недоступен, видно на старте.
+        self._init_image_logging()
+
         # Инициализация компонентов.
         # WHEEL_BASE прокидываем в SLAM явно — single source of truth, иначе
         # omega восстанавливается с ошибкой 35-50% и scan matcher не сходится.
@@ -184,9 +288,17 @@ class NavigationController:
         # при стоящих колёсах.
         self.turn_speed = 25             # Скорость поворота
         self.min_obstacle_distance = 0.4 # Минимальное расстояние до препятствия (м)
-        # Дистанции меряются ОТ ЦЕНТРА робота; нос камеры ~0.12 м впереди,
-        # поэтому 0.20 от центра = ~8 см от носа (старые 0.15 = 3 см).
-        self.critical_distance = 0.20    # Критическое расстояние для экстренной остановки
+        # Дистанции меряются ОТ ЦЕНТРА робота; нос ~0.12 м впереди. УЗ при этом
+        # меряет от своего места (≈ нос), поэтому запас по факту ещё больше.
+        # 0.28 → ~16 см от носа: с учётом латентности цикла и тормозного пути
+        # робот не утыкается в препятствие (нога/порог) носом. Старое 0.20 =
+        # ~8 см от носа — успевал коснуться до полной остановки.
+        self.critical_distance = 0.28    # Критическое расстояние для экстренной остановки
+        # Порог прерывания ПОВОРОТА на месте — отдельный и более тесный, чем
+        # forward-critical: вращение не двигает робота вперёд, и поворачивать
+        # надо именно ОТ близкого препятствия. Если приравнять к 0.28, робот
+        # станет слишком робким, чтобы отвернуться от объекта в ~0.25 м.
+        self.rotate_safety_distance = 0.20
         self.goal_tolerance = 0.2        # допустимое отклонение от цели (м)
 
         # Текущая цель
@@ -465,47 +577,83 @@ class NavigationController:
         except OSError:
             pass
 
-    def _maybe_floor_segmentation(self, frame, depth):
+    def _init_image_logging(self):
         """
-        Сегментация пола (SegFormer) — ОТДЕЛЬНЫЙ канал, на алгоритм навигации не
-        влияет. Карту и реактивный слой НЕ трогает, depth-отладку
-        (results/<запуск>/depth/) тоже. Если оба флага False — мгновенный выход.
+        Поднять фоновый логгер кадров камеры (results/<запуск>/segmentation/).
 
-          FLOOR_SEG_CAPTURE_RAW — сохранить сырой кадр (+глубину) для офлайн-оценки;
-                                  модель на роботе не нужна.
-          FLOOR_SEG_ENABLED     — прогнать SegFormer + калибровку на роботе и
-                                  сохранить overlay (в карту НЕ пишем).
+        Каталог создаётся и ПРОВЕРЯЕТСЯ на запись прямо здесь, на старте: если
+        путь недоступен (права/носитель/только-чтение), это печатается сразу
+        громкой строкой — раньше ошибка записи терялась в _log_sensor_error
+        внутри цикла, и пользователь видел «кадры не пишутся» без причины.
+
+        Запись кадров декуплена от инференса глубины (см. _maybe_log_camera_frame):
+        кадр сохраняется, даже если модель глубины недоступна или медленная.
         """
-        if not (self.FLOOR_SEG_CAPTURE_RAW or self.FLOOR_SEG_ENABLED):
+        self._image_logger = None
+        self._last_floor_seg_time = 0.0
+        if not self.FLOOR_SEG_CAPTURE_RAW:
+            return
+        print(f"[NavController] Лог кадров камеры → {self.seg_dir}")
+        try:
+            os.makedirs(self.seg_dir, exist_ok=True)
+            probe = os.path.join(self.seg_dir, '.write_test')
+            with open(probe, 'w') as f:
+                f.write('ok')
+            os.remove(probe)
+        except OSError as e:
+            print(f"[NavController] !!! Каталог кадров НЕдоступен для записи: "
+                  f"{type(e).__name__}: {e} — кадры писаться НЕ будут")
+            return
+        self._image_logger = _ImageLogger(keep=self.FLOOR_SEG_KEEP)
+        self._image_logger.start()
+
+    def _maybe_log_camera_frame(self, worker):
+        """
+        Раз в FLOOR_SEG_PERIOD_S положить последний кадр камеры (+глубину, если
+        есть) в очередь фонового логгера. От инференса глубины НЕ зависит — кадр
+        читает поток камеры (_DepthWorker), главный цикл лишь забирает снимок и
+        отдаёт логгеру. Диск тут не трогается → контур управления не морозится.
+        """
+        logger = getattr(self, '_image_logger', None)
+        if logger is None or worker is None:
             return
         now = time.time()
         if now - getattr(self, '_last_floor_seg_time', 0.0) < self.FLOOR_SEG_PERIOD_S:
             return
+        snap = worker.peek_frame()
+        if snap is None:
+            return
+        frame, _pose, depth, _ts = snap
         self._last_floor_seg_time = now
+        base = 'cap_' + time.strftime('%Y%m%d_%H%M%S') + f"_{int(now * 1000) % 1000:03d}"
+        # float16: глубину уже посчитал depth-поток — офлайн не пересчитываем.
+        depth_to_save = depth if (self.FLOOR_SEG_CAPTURE_DEPTH and depth is not None) else None
+        logger.submit(self.seg_dir, base, frame, depth_to_save)
+        # Лёгкая отметка кадра в единой шкале сенсоров (сам кадр — в segmentation/).
+        self.recorder.record_camera(
+            now, base + '.jpg', (base + '.npy') if depth_to_save is not None else None)
+
+    def _maybe_floor_segmentation(self, frame, depth):
+        """
+        Сегментация пола (SegFormer) — ОТДЕЛЬНЫЙ канал, на алгоритм навигации не
+        влияет. Карту и реактивный слой НЕ трогает. По умолчанию выключен
+        (FLOOR_SEG_ENABLED=False → мгновенный выход).
+
+        Сырой захват кадров (FLOOR_SEG_CAPTURE_RAW) переехал в фоновый логгер
+        (_maybe_log_camera_frame / _ImageLogger) — он не блокирует контур и не
+        зависит от наличия глубины. Здесь остался только тяжёлый боевой инференс.
+        """
+        if not self.FLOOR_SEG_ENABLED:
+            return
+        now = time.time()
+        if now - getattr(self, '_last_floor_seg_run', 0.0) < self.FLOOR_SEG_PERIOD_S:
+            return
+        self._last_floor_seg_run = now
 
         import cv2  # на роботе есть (используется камерой)
         ts = time.strftime('%Y%m%d_%H%M%S') + f"_{int(now * 1000) % 1000:03d}"
 
-        # 1) Сырой захват для офлайн-оценки — дёшево, модель на роботе не нужна.
-        if self.FLOOR_SEG_CAPTURE_RAW:
-            try:
-                os.makedirs(self.seg_dir, exist_ok=True)
-                jpg_name = f'cap_{ts}.jpg'
-                cv2.imwrite(os.path.join(self.seg_dir, jpg_name),
-                            frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-                npy_name = None
-                if self.FLOOR_SEG_CAPTURE_DEPTH and depth is not None:
-                    # float16: глубина уже посчитана depth-потоком — офлайн не пересчитываем.
-                    npy_name = f'cap_{ts}.npy'
-                    np.save(os.path.join(self.seg_dir, npy_name),
-                            depth.astype(np.float16))
-                self._rotate_dir(self.seg_dir, 'cap_', self.FLOOR_SEG_KEEP)
-                # Лёгкая отметка кадра в единой шкале сенсоров (сам кадр — в segmentation/)
-                self.recorder.record_camera(time.time(), jpg_name, npy_name)
-            except Exception as e:
-                self._log_sensor_error('floor_seg_capture', e)
-
-        # 2) Боевой инференс на роботе (тяжело) — только overlay в лог, в карту НЕ пишем.
+        # Боевой инференс на роботе (тяжело) — только overlay в лог, в карту НЕ пишем.
         if self.FLOOR_SEG_ENABLED:
             try:
                 if not hasattr(self, '_floor_segmenter'):
@@ -773,9 +921,12 @@ class NavigationController:
                         self._save_camera_debug_frame(
                             frame, depth, pose, cam_dists)
                     # Сегментация пола (SegFormer) — отдельный канал, по
-                    # умолчанию выключен (оба флага False → мгновенный выход),
-                    # существующее логирование не затрагивает.
+                    # умолчанию выключен; на навигацию не влияет.
                     self._maybe_floor_segmentation(frame, depth)
+                # Периодический лог кадров камеры — НЕ зависит от того, дал ли
+                # инференс глубину в этом такте: пишем последний прочитанный
+                # кадр (см. _maybe_log_camera_frame). Запись — в фоне.
+                self._maybe_log_camera_frame(worker)
             except Exception as e:
                 self._log_sensor_error('camera', e)
 
@@ -1076,7 +1227,7 @@ class NavigationController:
             return 0.0  # почти симметрично — едем прямо
         return float(np.clip(imbalance * 2.0, -1.0, 1.0) * self.CRUISE_STEER_MAX)
 
-    def _safe_move_forward(self, max_duration=1.0, check_interval=0.2,
+    def _safe_move_forward(self, max_duration=1.0, check_interval=0.1,
                            speed=None, stop_at_end=True, steer_to_free=False):
         """
         Безопасное движение вперед с постоянной проверкой препятствий.
@@ -1112,16 +1263,14 @@ class NavigationController:
 
         try:
             while time.time() - start_time < max_duration:
-                # Ждем до следующей проверки
-                time.sleep(check_interval)
-                # Тикаем SLAM/одометрию пока движемся, иначе позиция/угол не накапливаются
+                # Тикаем одометрию/SLAM И читаем сенсоры СРАЗУ, до ожидания:
+                # объект (нога) мог появиться только что — нельзя ехать вслепую
+                # первые check_interval. Ожидание перенесено в КОНЕЦ итерации.
                 self._tick()
                 check_count += 1
 
-                # Проверяем датчики
                 obstacle_distance = self.sensor_fusion.get_obstacle_distance('front')
-
-                # Если нет данных от датчиков, используем ультразвук напрямую
+                # Если слияние молчит — пробуем ультразвук напрямую
                 if obstacle_distance is None and self.use_ultrasonic:
                     try:
                         from ultrasonic import read_distance_cm_from_bot
@@ -1129,7 +1278,7 @@ class NavigationController:
                         if us_cm is not None and us_cm > 0:
                             obstacle_distance = us_cm / 100.0
                             print(f"[SAFE_MOVE] Ультразвук: {obstacle_distance:.2f}м")
-                    except:
+                    except Exception:
                         pass
 
                 if obstacle_distance is None:
@@ -1140,39 +1289,42 @@ class NavigationController:
                         print("[SAFE_MOVE] Нет данных 3 проверки подряд, останавливаюсь")
                         safe = False
                         break
-                    continue  # Продолжаем движение, но с осторожностью
-                no_data_streak = 0
+                else:
+                    no_data_streak = 0
 
-                # КРИТИЧЕСКОЕ расстояние - немедленная остановка
-                if obstacle_distance < self.critical_distance:
-                    print(f"[SAFE_MOVE] ⚠️ КРИТИЧЕСКОЕ РАССТОЯНИЕ! {obstacle_distance:.2f}м")
-                    safe = False
-                    break
-
-                # Очень близко (меньше половины min_distance) — стоп
-                if obstacle_distance < self.min_obstacle_distance:
-                    closeness = (self.min_obstacle_distance - obstacle_distance) / self.min_obstacle_distance
-                    if closeness > 0.5:
-                        print(f"[SAFE_MOVE] Очень близко: {obstacle_distance:.2f}м")
+                    # КРИТИЧЕСКОЕ расстояние — немедленная остановка
+                    if obstacle_distance < self.critical_distance:
+                        print(f"[SAFE_MOVE] ⚠️ КРИТИЧЕСКОЕ РАССТОЯНИЕ! {obstacle_distance:.2f}м")
                         safe = False
                         break
 
-                # Плавное замедление по дистанции + мягкий увод к простору
-                target_pwm = self._speed_for_distance(base_pwm, obstacle_distance)
-                target_steer = self._steer_to_free_space() if steer_to_free else 0.0
-                if (abs(target_pwm - current_pwm) >= 3
-                        or abs(target_steer - current_steer) >= 5.0):
-                    current_pwm, current_steer = target_pwm, target_steer
-                    self._apply_forward(current_pwm, current_steer)
-                    if current_pwm != base_pwm:
-                        print(f"[SAFE_MOVE] Замедляюсь: PWM={current_pwm} "
-                              f"(препятствие {obstacle_distance:.2f}м)")
-                    if abs(current_steer) >= 5.0:
-                        print(f"[SAFE_MOVE] Увод к простору: {current_steer:+.0f}%")
+                    # Очень близко (меньше половины min_distance) — стоп
+                    if obstacle_distance < self.min_obstacle_distance:
+                        closeness = (self.min_obstacle_distance - obstacle_distance) / self.min_obstacle_distance
+                        if closeness > 0.5:
+                            print(f"[SAFE_MOVE] Очень близко: {obstacle_distance:.2f}м")
+                            safe = False
+                            break
 
-                # Все OK, продолжаем
-                if check_count % 5 == 0:  # Реже выводим
-                    print(f"[SAFE_MOVE] Двигаюсь... препятствие: {obstacle_distance:.2f}м")
+                    # Плавное замедление по дистанции + мягкий увод к простору
+                    target_pwm = self._speed_for_distance(base_pwm, obstacle_distance)
+                    target_steer = self._steer_to_free_space() if steer_to_free else 0.0
+                    if (abs(target_pwm - current_pwm) >= 3
+                            or abs(target_steer - current_steer) >= 5.0):
+                        current_pwm, current_steer = target_pwm, target_steer
+                        self._apply_forward(current_pwm, current_steer)
+                        if current_pwm != base_pwm:
+                            print(f"[SAFE_MOVE] Замедляюсь: PWM={current_pwm} "
+                                  f"(препятствие {obstacle_distance:.2f}м)")
+                        if abs(current_steer) >= 5.0:
+                            print(f"[SAFE_MOVE] Увод к простору: {current_steer:+.0f}%")
+
+                    # Все OK, продолжаем
+                    if check_count % 5 == 0:  # Реже выводим
+                        print(f"[SAFE_MOVE] Двигаюсь... препятствие: {obstacle_distance:.2f}м")
+
+                # Ожидание В КОНЦЕ: первая проверка уже прошла без слепого хода.
+                time.sleep(check_interval)
 
         except Exception as e:
             print(f"[SAFE_MOVE] Ошибка при движении: {e}")
@@ -1187,7 +1339,7 @@ class NavigationController:
             else:
                 ca.stop_robot()
                 self._set_movement_command("stop", 0)
-                time.sleep(0.3)
+                time.sleep(0.1)  # дать тележке осесть после стопа (было 0.3 — лишняя вялость)
 
         if safe:
             if stop_at_end:
@@ -1239,7 +1391,7 @@ class NavigationController:
                 time.sleep(check_interval)
                 self._tick()  # одометрия + SLAM пока крутимся
                 distance = self.sensor_fusion.get_obstacle_distance('front')
-                if distance and distance < self.critical_distance:
+                if distance and distance < self.rotate_safety_distance:
                     print(f"[SAFETY] Слишком близко при повороте: {distance:.2f}м")
                     safe = False
                     break
@@ -1747,6 +1899,17 @@ class NavigationController:
         if getattr(self, 'camera_cap', None) is not None:
             try:
                 self.camera_cap.release()
+            except Exception:
+                pass
+
+        # Фоновый логгер кадров — дописать остаток очереди и закрыть.
+        if getattr(self, '_image_logger', None) is not None:
+            try:
+                self._image_logger.stop()
+                if self._image_logger.dropped:
+                    print(f"[NavController] Лог кадров: записано "
+                          f"{self._image_logger.written}, отброшено "
+                          f"{self._image_logger.dropped} (очередь переполнялась)")
             except Exception:
                 pass
 

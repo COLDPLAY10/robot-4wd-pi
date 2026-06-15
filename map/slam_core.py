@@ -488,9 +488,10 @@ class SLAM:
                 near_obstacles = obstacles[obs_dist <= map_cap]
             else:
                 near_obstacles = obstacles
-            for ox, oy, _oz in near_obstacles:
-                self.map.update_cell(float(ox), float(oy),
-                                     occupied=True, confidence=0.7)
+            if len(near_obstacles) > 0:
+                self.map.update_cells_batch(near_obstacles[:, 0],
+                                            near_obstacles[:, 1],
+                                            occupied=True, confidence=0.7)
 
             # 2. Свободное пространство по лучу от робота к каждой точке глубины
             #    (НЕ только препятствие — любая depth-точка значит "до неё пусто").
@@ -504,17 +505,29 @@ class SLAM:
                 ray_candidates = points
             ray_stride = max(1, pixel_stride * 2)
             ray_points = ray_candidates[::ray_stride]
-            for tx, ty, _tz in ray_points:
-                dist = float(np.hypot(tx - robot_x, ty - robot_y))
-                if dist < self.map.resolution:
-                    continue
-                num_steps = max(2, int(dist / (self.map.resolution * 2)))
-                for i in range(1, num_steps):
-                    t = i / num_steps
-                    free_x = robot_x + t * (tx - robot_x)
-                    free_y = robot_y + t * (ty - robot_y)
-                    self.map.update_cell(free_x, free_y,
-                                         occupied=False, confidence=0.3)
+            # Векторно, как для лидара (см. update_with_lidar): сетка шагов
+            # (лучи × max_steps) с маской по длине луча. Шаги — через ДВЕ клетки
+            # (как в прежнем поштучном варианте). Лучи короче resolution
+            # отбрасываем; конечную точку (i=steps) НЕ включаем, чтобы free-луч
+            # не затирал только что записанное occupied-препятствие.
+            if len(ray_points) > 0:
+                rdx = ray_points[:, 0] - robot_x
+                rdy = ray_points[:, 1] - robot_y
+                rdist = np.hypot(rdx, rdy)
+                far = rdist >= self.map.resolution
+                rdx, rdy, rdist = rdx[far], rdy[far], rdist[far]
+                if len(rdist) > 0:
+                    steps = np.maximum(
+                        2, (rdist / (self.map.resolution * 2)).astype(np.int32))
+                    max_steps = int(steps.max())
+                    if max_steps > 1:
+                        i_idx = np.arange(1, max_steps, dtype=np.float32)[None, :]
+                        valid = i_idx < steps[:, None]
+                        t = i_idx / steps[:, None].astype(np.float32)
+                        free_x = robot_x + t * rdx[:, None]
+                        free_y = robot_y + t * rdy[:, None]
+                        self.map.update_cells_batch(free_x[valid], free_y[valid],
+                                                    occupied=False, confidence=0.3)
 
         return obstacles
 
