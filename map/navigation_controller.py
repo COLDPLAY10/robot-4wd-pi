@@ -114,6 +114,65 @@ class _DepthWorker(threading.Thread):
             self.join(timeout=timeout)
 
 
+class _SegWorker(threading.Thread):
+    """
+    Фоновый поток сегментации пола (SegFormer). ОТДЕЛЬНЫЙ от _DepthWorker и
+    медленнее него — намеренно: depth и страховочный канал nearest_in_depth_band
+    (ловит ножки/тонкое для БЫСТРОЙ реакции) не должны наследовать латентность
+    второй сети. Слияние seg+depth идёт на СВЕЖЕЙ глубине и ПОСЛЕДНЕЙ маске:
+    floor/не-floor пространственно стабилен ~секунду при ≤0.16 м/с, а высота
+    берётся из свежей глубины и свежей подгонки плоскости.
+
+    Берёт кадр из _DepthWorker.peek_frame() (не открывает камеру второй раз),
+    сегментирует, публикует последнюю маску. При недоступной модели поток не
+    запускается — слияние тихо откатывается на legacy height-filter.
+    """
+
+    def __init__(self, peek_frame, segmenter, period_s: float):
+        super().__init__(daemon=True, name="seg-worker")
+        self._peek = peek_frame
+        self._segmenter = segmenter
+        self._period_s = period_s
+        self._stop_evt = threading.Event()
+        self._lock = threading.Lock()
+        self._mask = None          # (floor_mask, ts)
+        self._last_frame_ts = None
+        self.inference_count = 0
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            t0 = time.time()
+            try:
+                snap = self._peek()
+                # snap = (frame, pose, depth|None, ts) из _DepthWorker
+                if snap is not None and snap[3] != self._last_frame_ts:
+                    frame = snap[0]
+                    self._last_frame_ts = snap[3]
+                    mask = self._segmenter.segment_floor(frame)
+                    if mask is not None:
+                        with self._lock:
+                            self._mask = (mask, time.time())
+                        self.inference_count += 1
+            except Exception as e:
+                print(f"[SegWorker] Ошибка: {type(e).__name__}: {e}")
+                self._stop_evt.wait(0.5)
+            elapsed = time.time() - t0
+            if elapsed < self._period_s:
+                self._stop_evt.wait(self._period_s - elapsed)
+
+    def latest_mask(self, max_age_s: float):
+        """Последняя маска пола, если свежее max_age_s; иначе None (→ fallback)."""
+        with self._lock:
+            if self._mask is not None and (time.time() - self._mask[1]) <= max_age_s:
+                return self._mask[0]
+        return None
+
+    def stop(self, timeout: float = 2.0):
+        self._stop_evt.set()
+        if self.is_alive():
+            self.join(timeout=timeout)
+
+
 class _ImageLogger(threading.Thread):
     """
     Фоновый писатель кадров камеры на диск (results/<запуск>/segmentation/).
@@ -410,6 +469,34 @@ class NavigationController:
         'models', 'depth_anything_v2_small.onnx',
     )
 
+    # ===== Слияние сегментации пола и глубины (seg ∩ depth) =====
+    # Главная ценность камеры: ловить то, что 2D-лидар по высоте пропускает
+    # (ножки стола/стула, низкие/высокие препятствия вне плоскости луча).
+    # Контракт — camera_perception/floor_fusion.py: препятствие = НЕ floor (seg)
+    # И приподнято над плоскостью пола (весь кадр); объект в цвет пола ловится
+    # strong-клаузой. Высота над ПЛОСКОСТЬЮ (подгонка по floor-пикселям), а не над
+    # mount-калибровкой — не зависит от наклона камеры и масштаба глубины.
+    #
+    # БЕЗОПАСНОСТЬ: на быструю реактивную остановку НЕ влияет — та идёт по
+    # лидару/УЗ и страховочному depth-каналу nearest_in_depth_band (он БЕЗ
+    # сегментации, на такте глубины). Сегментация крутится в ОТДЕЛЬНОМ медленном
+    # потоке (_SegWorker), маска кэшируется; слияние на свежей глубине + последней
+    # маске. Нет маски / не подогналась плоскость → ОТКАТ на legacy height-filter
+    # (см. slam_core.update_with_camera_depth), никогда не «нет препятствий».
+    CAMERA_FLOOR_FUSION_ENABLED = True
+    CAMERA_FLOOR_FUSION_PERIOD_S = 0.8    # темп seg-потока. Близко к темпу глубины
+                                          # (0.7 с) — обе сети делят 4 ядра Pi:
+                                          # СЛЕДИТЬ за FPS глубины на первом заезде,
+                                          # при просадке вернуть к 1.0–1.5 с.
+    CAMERA_FLOOR_MASK_MAX_AGE_S = 3.0     # маска старше — считаем протухшей → fallback
+    CAMERA_STRONG_OBSTACLE_HEIGHT_M = 0.30  # выше — препятствие даже если seg сказал «пол»
+    # Верхний порог высоты препятствия (ceiling-guard вместо «нижней половины»):
+    # выше — потолок/верх стен, низкому роботу не угроза. Прокидывается явно в
+    # update_with_camera_depth (и в fusion, и в legacy-fallback) — без него slam
+    # брал бы свой дефолт 0.50, а контракт проверялся при 0.60. Держать в синхроне
+    # с тем, на чём гоняли tests/eval.
+    CAMERA_MAX_OBSTACLE_HEIGHT_M = 0.60
+
     # ===== Каталог результатов: всё пишется в results/<запуск>/ =====
     # Один запуск контроллера = одна подпапка по времени старта, внутри:
     #   maps/         — карты .pkl + .png (см. save_map),
@@ -516,6 +603,7 @@ class NavigationController:
         # Фоновый инференс: контур управления больше не блокируется на
         # нейронке (см. _DepthWorker). Без камеры поток не нужен.
         self._depth_worker = None
+        self._seg_worker = None
         if self.camera_cap is not None:
             self._depth_worker = _DepthWorker(
                 self.camera_cap, self.depth_estimator,
@@ -526,6 +614,28 @@ class NavigationController:
             )
             self._depth_worker.start()
             print("[NavController] Поток инференса глубины запущен")
+
+            # Слияние seg+depth: отдельный медленный поток сегментации пола.
+            # Берёт кадры из depth-потока (peek_frame), не открывает камеру
+            # повторно. Если модель не загрузилась — поток не стартуем, слияние
+            # тихо откатится на legacy height-filter.
+            if self.CAMERA_FLOOR_FUSION_ENABLED:
+                try:
+                    from camera_segmentation import FloorSegmenter
+                    segmenter = FloorSegmenter(model_path=self.FLOOR_SEG_MODEL_PATH)
+                    if segmenter.is_ready():
+                        self._seg_worker = _SegWorker(
+                            self._depth_worker.peek_frame, segmenter,
+                            period_s=self.CAMERA_FLOOR_FUSION_PERIOD_S,
+                        )
+                        self._seg_worker.start()
+                        print("[NavController] Поток сегментации пола (слияние seg+depth) запущен")
+                    else:
+                        print("[NavController] SegFormer не загрузился — слияние выкл, "
+                              "depth работает по legacy height-filter")
+                except Exception as e:
+                    print(f"[NavController] Слияние seg+depth недоступно ({e}); "
+                          "depth по legacy height-filter")
 
     def _save_camera_debug_frame(self, frame, depth, pose, cam_dists):
         """
@@ -875,10 +985,17 @@ class NavigationController:
                 if result is not None:
                     frame, depth, pose, ts = result
                     self._depth_consumed_ts = ts
+                    # Слияние seg+depth: последняя маска пола из медленного
+                    # seg-потока (None если поток выкл / маска протухла / модель
+                    # недоступна → update_with_camera_depth откатится на legacy
+                    # height-filter). Это НЕ на критическом пути быстрой остановки.
+                    floor_mask = (self._seg_worker.latest_mask(
+                                      self.CAMERA_FLOOR_MASK_MAX_AGE_S)
+                                  if self._seg_worker is not None else None)
                     # update_with_camera_depth пишет в карту (только в
                     # mapping, и только до CAMERA_MAP_MAX_RANGE_M) и
-                    # ВОЗВРАЩАЕТ облако препятствий по высоте на всю
-                    # дальность анализа — доступно и в localization.
+                    # ВОЗВРАЩАЕТ облако препятствий на всю дальность анализа —
+                    # доступно и в localization.
                     # pose — поза НА МОМЕНТ ЗАХВАТА кадра (см. _DepthWorker).
                     obstacles = self.slam.update_with_camera_depth(
                         depth, self.camera_intrinsics, self.camera_mount,
@@ -886,6 +1003,9 @@ class NavigationController:
                         max_range_m=self.CAMERA_MAX_RANGE_M,
                         map_write_max_range_m=self.CAMERA_MAP_MAX_RANGE_M,
                         robot_pose=pose,
+                        floor_mask=floor_mask,
+                        max_obstacle_height_m=self.CAMERA_MAX_OBSTACLE_HEIGHT_M,
+                        strong_obstacle_height_m=self.CAMERA_STRONG_OBSTACLE_HEIGHT_M,
                     )
                     # Реактивный слой: секторные расстояния + коридор
                     # движения из того же облака → в sensor_fusion.
@@ -1890,6 +2010,11 @@ class NavigationController:
                 print(f"[NavController] Ошибка остановки лидара: {e}")
         
         # Останавливаем фоновый инференс и освобождаем камеру
+        if getattr(self, '_seg_worker', None) is not None:
+            try:
+                self._seg_worker.stop()
+            except Exception:
+                pass
         if getattr(self, '_depth_worker', None) is not None:
             try:
                 print("[NavController] Останавливаю поток инференса...")

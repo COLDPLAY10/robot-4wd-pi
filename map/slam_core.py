@@ -417,7 +417,9 @@ class SLAM:
                                  max_obstacle_height_m: float = 0.50,
                                  max_range_m: float = 6.0,
                                  map_write_max_range_m: Optional[float] = None,
-                                 robot_pose: Optional[Tuple[float, float, float]] = None):
+                                 robot_pose: Optional[Tuple[float, float, float]] = None,
+                                 floor_mask: Optional[np.ndarray] = None,
+                                 strong_obstacle_height_m: float = 0.30):
         """
         Обновление карты препятствий из карты глубины (Depth-Anything-V2).
 
@@ -446,6 +448,16 @@ class SLAM:
                          по текущей позе сдвигает облако на пройденный путь.
                          None = текущая поза (для совместимости со старыми
                          вызовами, где кадр обрабатывался синхронно).
+            floor_mask: H×W bool маска пола (SegFormer) или None. Если задана —
+                         препятствия считаются СЛИЯНИЕМ seg+depth по контракту
+                         floor_fusion (НЕ floor И приподнято над плоскостью пола;
+                         весь кадр; объект в цвет пола ловится strong-клаузой).
+                         Если плоскость пола подогнать нельзя (мало floor-пикселей:
+                         стена в упор, промах seg) ИЛИ floor_mask=None — ОТКАТ на
+                         legacy height-filter (нижняя половина кадра), НИКОГДА не
+                         «нет препятствий».
+            strong_obstacle_height_m: порог strong-клаузы fusion (объект выше —
+                         препятствие даже если seg назвал его полом).
         """
         if depth_map is None or depth_map.size == 0:
             return np.zeros((0, 3), dtype=np.float32)
@@ -461,6 +473,10 @@ class SLAM:
             robot_y = self.current_position.y
             robot_theta = self.current_position.theta
 
+        # points (нижняя половина) — для разметки СВОБОДНОГО вдоль лучей, как и
+        # раньше. Препятствия же берём из слияния seg+depth (весь кадр), а при
+        # отсутствии маски/невозможности подгонки плоскости — из legacy
+        # height-filter по этим же points.
         points = backproject_depth_to_world(
             depth_map, intrinsics, mount,
             robot_pose=(robot_x, robot_y, robot_theta),
@@ -469,9 +485,25 @@ class SLAM:
             max_depth_m=max_range_m,
             use_lower_half_only=True,
         )
-        obstacles = filter_obstacles_by_height(points,
-                                               min_height_m=min_obstacle_height_m,
-                                               max_height_m=max_obstacle_height_m)
+
+        obstacles = None
+        if floor_mask is not None:
+            from camera_perception.floor_fusion import fuse_camera_obstacles
+            obstacles = fuse_camera_obstacles(
+                depth_map, floor_mask, intrinsics, mount,
+                robot_pose=(robot_x, robot_y, robot_theta),
+                pixel_stride=pixel_stride,
+                min_depth_m=0.15,
+                max_range_m=max_range_m,
+                min_obstacle_height_m=min_obstacle_height_m,
+                max_obstacle_height_m=max_obstacle_height_m,
+                strong_obstacle_height_m=strong_obstacle_height_m,
+            )
+        # Откат на legacy, если маски нет ИЛИ плоскость не подогналась (None).
+        if obstacles is None:
+            obstacles = filter_obstacles_by_height(
+                points, min_height_m=min_obstacle_height_m,
+                max_height_m=max_obstacle_height_m)
 
         # Запись в карту — только в режиме построения; в localization карта
         # read-only. Облако препятствий при этом возвращается ВСЕГДА: оно нужно

@@ -118,6 +118,34 @@ def backproject_depth_to_world(
     x_cam = (uu - intrinsics.cx) * z_cam / intrinsics.fx
     y_cam = (vv - intrinsics.cy) * z_cam / intrinsics.fy
 
+    x_w, y_w, z_w = camera_to_world(x_cam, y_cam, z_cam, mount,
+                                    (rx, ry, rtheta))
+
+    points = np.column_stack([x_w, y_w, z_w]).astype(np.float32)
+    if return_pixels:
+        return points, np.column_stack([uu, vv]).astype(np.int32)
+    return points
+
+
+def camera_to_world(x_cam, y_cam, z_cam, mount, robot_pose):
+    """
+    Перевести точки из системы КАМЕРЫ (x вправо, y вниз, z вперёд) в МИРОВУЮ,
+    учитывая монтаж камеры (высота/тилт/вынос) и позу робота.
+
+    Векторно и скалярно работает одинаково (numpy broadcasting). Вынесено из
+    backproject_depth_to_world, чтобы тот же переход переиспользовал floor_fusion
+    (препятствия из seg+depth) — единая формула, без расхождений.
+
+    Args:
+        x_cam, y_cam, z_cam: координаты в системе камеры (массивы или скаляры)
+        mount: CameraMount (height_m, forward_offset_m, tilt_rad)
+        robot_pose: (x, y, theta) робота в мировой системе
+
+    Returns:
+        (x_w, y_w, z_w) — той же формы, что вход.
+    """
+    rx, ry, rtheta = robot_pose
+
     # Переход в систему робота (x_r вперёд, y_r влево, z_r вверх).
     # Сначала "горизонтальная" камера: x_r = z_cam, y_r = -x_cam, z_r = -y_cam
     # Затем поворот по тилту вокруг оси y_r:
@@ -140,11 +168,7 @@ def backproject_depth_to_world(
     x_w = rx + cos_th * x_r - sin_th * y_r
     y_w = ry + sin_th * x_r + cos_th * y_r
     z_w = z_r  # робот ездит по плоскому полу, мировой z = роботовский z
-
-    points = np.column_stack([x_w, y_w, z_w]).astype(np.float32)
-    if return_pixels:
-        return points, np.column_stack([uu, vv]).astype(np.int32)
-    return points
+    return x_w, y_w, z_w
 
 
 def filter_obstacles_by_height(

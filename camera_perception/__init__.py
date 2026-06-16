@@ -14,9 +14,15 @@ from .projection import (
     CameraIntrinsics,
     CameraMount,
     backproject_depth_to_world,
+    camera_to_world,
     filter_obstacles_by_height,
     nearest_in_depth_band,
     obstacle_distances_by_sector,
+)
+from .floor_fusion import (
+    fuse_camera_obstacles,
+    fit_floor_plane_camera,
+    classify_pixels,
 )
 from .debug_viz import render_depth_debug
 
@@ -25,8 +31,12 @@ __all__ = [
     'CameraIntrinsics',
     'CameraMount',
     'backproject_depth_to_world',
+    'camera_to_world',
     'filter_obstacles_by_height',
     'nearest_in_depth_band',
     'obstacle_distances_by_sector',
+    'fuse_camera_obstacles',
+    'fit_floor_plane_camera',
+    'classify_pixels',
     'render_depth_debug',
 ]
