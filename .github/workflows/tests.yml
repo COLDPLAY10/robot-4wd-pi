@@ -1,0 +1,24 @@
+name: tests
+
+# Юнит-тесты восприятия гоняются БЕЗ железа и БЕЗ ONNX-моделей: контракт
+# слияния пол(seg)+глубина проверяется на синтетических массивах
+# (tests/test_floor_fusion.py). Нужны только numpy и cv2 (camera_perception при
+# импорте тянет cv2). Raspbot_Lib / onnxruntime / модели на runner НЕ нужны.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        # headless-сборка opencv: на runner нет дисплея/libGL.
+        run: pip install numpy opencv-python-headless
+      - name: Run floor_fusion unit tests
+        run: python3 tests/test_floor_fusion.py
