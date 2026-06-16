@@ -419,10 +419,12 @@ class NavigationController:
     CAMERA_SERVO_PAN_ID = 1
     CAMERA_SERVO_TILT_ID = 2
     CAMERA_SERVO_PAN_DEG = 90    # центр по горизонтали
-    # 25 — штатное рабочее положение Yahboom. ВАЖНО: если при tilt=25 взгляд
-    # не строго горизонтален, вписать фактический наклон оптической оси в
-    # CAMERA_MOUNT_TILT_RAD (>0 = вниз) — см. ROBOT_CHECKLIST.md.
-    CAMERA_SERVO_TILT_DEG = 25
+    # 25 — штатное рабочее положение Yahboom; поднято на +10° (35), чтобы камера
+    # смотрела выше к горизонту, а не «в пол под нос». ВАЖНО: серво разомкнут
+    # (Ctrl_Servo без обратной связи) — фактический наклон оптической оси
+    # подтвердить по кадрам заезда (scripts/eval_floor_segmentation.py) и вписать
+    # в CAMERA_MOUNT_TILT_RAD (>0 = вниз) — см. ROBOT_CHECKLIST.md.
+    CAMERA_SERVO_TILT_DEG = 35
     CAMERA_MOUNT_HEIGHT_M = 0.125  # высота объектива над полом (замер)
     # Из замеров: длина 0.209 м (нос камеры → задний край колеса), задний свес
     # от центра вращения ≈ 0.089 м → объектив ≈ 0.12 м впереди центра.
