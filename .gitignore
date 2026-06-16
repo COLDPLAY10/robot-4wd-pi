@@ -48,6 +48,8 @@ map_*.png
 map_scripts/map_*.png
 *_trajectory*.png
 
+test_pictures
+
 # Логи
 *.log
 

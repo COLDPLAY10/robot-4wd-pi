@@ -26,6 +26,14 @@ import numpy as np
 # Стандартные параметры Depth-Anything-V2: квадратный вход кратный 14
 # (под patch ViT), нормализация по ImageNet.
 DEFAULT_INPUT_SIZE = 518
+
+# Калибровочный делитель метрической глубины — аналог DISTANCE_DIVISOR в lidar.py
+# (калибровка конкретного "сенсора" живёт в его драйвере, не в NavigationController).
+# Вариант metric-indoor выдаёт метры, но абсолютный масштаб на нашей установке/
+# сценах систематически завышен ~вчетверо (проверка scripts/eval_test_pictures.py:
+# стена в ~0.3-0.5 м читалась как 1.05-2.88 м; /4 -> 0.26-0.72 м совпадает с
+# рулеткой). ПРОВИЗОРНО: подтвердить замером по эталонной дистанции и поправить.
+DEFAULT_DEPTH_SCALE = 4.0
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
@@ -40,14 +48,18 @@ class DepthEstimator:
                  model_path: Optional[str] = None,
                  input_size: int = DEFAULT_INPUT_SIZE,
                  num_threads: int = 2,
-                 max_depth_m: float = 10.0):
+                 max_depth_m: float = 10.0,
+                 depth_scale: float = DEFAULT_DEPTH_SCALE):
         """
         Args:
             model_path: путь к ONNX-файлу (см. scripts/setup_depth_model.py)
             input_size: размер входа модели (кратный 14)
             num_threads: ONNX Runtime intra-op threads. На Pi 5 (4 ядра) 2-3 хорошо;
                          больше — конкурирует со SLAM и DWA.
-            max_depth_m: всё что дальше — игнорируем (модель экстраполирует плохо)
+            max_depth_m: всё что дальше — игнорируем (модель экстраполирует плохо).
+                         Применяется ПОСЛЕ деления на depth_scale (к скорректированным метрам).
+            depth_scale: калибровочный делитель сырого выхода модели (см.
+                         DEFAULT_DEPTH_SCALE). 1.0 = без коррекции.
         """
         # Дефолт — абсолютный путь относительно репо (camera_perception/../models/).
         # Иначе CWD-зависимый относительный путь ломается при запуске из map_scripts/.
@@ -60,6 +72,7 @@ class DepthEstimator:
         self.input_size = input_size
         self.num_threads = num_threads
         self.max_depth_m = max_depth_m
+        self.depth_scale = depth_scale
 
         self._session = None  # ленивая инициализация
         self._input_name: Optional[str] = None
@@ -150,7 +163,10 @@ class DepthEstimator:
                 depth = cv2.resize(depth, (orig_w, orig_h),
                                    interpolation=cv2.INTER_CUBIC)
 
-            # Обрезаем нефизичные значения
+            # Калибровочная коррекция масштаба (DEFAULT_DEPTH_SCALE), затем
+            # обрезка нефизичных значений уже в скорректированных метрах.
+            if self.depth_scale != 1.0:
+                depth = depth / self.depth_scale
             depth = np.clip(depth, 0.0, self.max_depth_m).astype(np.float32)
             return depth
 
