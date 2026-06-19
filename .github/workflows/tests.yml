@@ -1,9 +1,14 @@
 name: tests
 
-# Юнит-тесты восприятия гоняются БЕЗ железа и БЕЗ ONNX-моделей: контракт
-# слияния пол(seg)+глубина проверяется на синтетических массивах
-# (tests/test_floor_fusion.py). Нужны только numpy и cv2 (camera_perception при
-# импорте тянет cv2). Raspbot_Lib / onnxruntime / модели на runner НЕ нужны.
+# Юнит-тесты гоняются БЕЗ железа и БЕЗ ONNX-моделей на синтетических данных:
+#   - test_floor_fusion       — контракт слияния пол(seg)+глубина (нужны numpy+cv2);
+#   - test_lidar_freshness     — продюсерская свежесть лидара, фикс A2 (serial
+#                                стабится в самом тесте, pyserial не нужен);
+#   - test_navigation_guards   — логика защитных веток навигации, фиксы A4/A5
+#                                (чистый Python);
+#   - test_seg_pairing          — контракт когерентной пары _SegWorker, фикс B5
+#                                (реальный класс, Raspbot_Lib/serial стабятся).
+# Raspbot_Lib / onnxruntime / модели на runner НЕ нужны.
 
 on:
   push:
@@ -20,5 +25,11 @@ jobs:
       - name: Install deps
         # headless-сборка opencv: на runner нет дисплея/libGL.
         run: pip install numpy opencv-python-headless
-      - name: Run floor_fusion unit tests
-        run: python3 tests/test_floor_fusion.py
+      - name: Run unit tests
+        # Каждый файл — самостоятельный раннер (sys.exit(1) при падении),
+        # поэтому набор прогоняем явно и валим job на первой же ошибке.
+        run: |
+          python3 tests/test_floor_fusion.py
+          python3 tests/test_lidar_freshness.py
+          python3 tests/test_navigation_guards.py
+          python3 tests/test_seg_pairing.py

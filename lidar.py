@@ -83,6 +83,11 @@ class LidarDriver:
 
         # Последний ПОЛНЫЙ оборот — то, что отдаёт get_scan()
         self.scan_data: List[Tuple[float, float]] = []
+        # Момент публикации последнего оборота (монотонно растёт при каждом
+        # новом обороте). Нужен потребителю, чтобы отличить свежий лидар от
+        # зависшего: get_scan() отдаёт последний оборот вечно и сам свежести
+        # не показывает. None — пока не опубликован ни один оборот.
+        self._last_scan_time: Optional[float] = None
         # Текущий оборот (копится между стартовыми пакетами CT&1)
         self._current_rev: List[Tuple[float, float]] = []
 
@@ -304,12 +309,14 @@ class LidarDriver:
                 # Стартовый пакет нового оборота: публикуем накопленный оборот
                 if self._current_rev:
                     self.scan_data = self._current_rev
+                    self._last_scan_time = time.time()
                     self.revolution_count += 1
                 self._current_rev = []
             self._current_rev.extend(points)
             # Fallback: если стартовые пакеты не приходят, не копим бесконечно
             if len(self._current_rev) > 2000:
                 self.scan_data = self._current_rev
+                self._last_scan_time = time.time()
                 self._current_rev = []
 
         self.packet_count += 1
@@ -334,6 +341,21 @@ class LidarDriver:
         """
         with self.lock:
             return list(self.scan_data)
+
+    def seconds_since_last_scan(self) -> Optional[float]:
+        """
+        Сколько секунд назад драйвер ОПУБЛИКОВАЛ последний полный оборот
+        (не когда его прочитали). None — пока не было ни одного оборота.
+
+        Потребителю это нужно, чтобы отличить свежий лидар от зависшего:
+        get_scan() отдаёт последний оборот вечно, поэтому при отвале порта/
+        затыке (поток чтения жив, но новых оборотов нет) свежесть по самому
+        скану не видна.
+        """
+        with self.lock:
+            if self._last_scan_time is None:
+                return None
+            return time.time() - self._last_scan_time
 
     def get_scan_degrees(self) -> List[Tuple[float, float]]:
         """Скан в градусах [0..360), отсортированный по углу."""

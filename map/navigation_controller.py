@@ -135,7 +135,7 @@ class _SegWorker(threading.Thread):
         self._period_s = period_s
         self._stop_evt = threading.Event()
         self._lock = threading.Lock()
-        self._mask = None          # (floor_mask, ts)
+        self._mask = None          # когерентная пара кадра: (mask, depth, pose, frame_ts)
         self._last_frame_ts = None
         self.inference_count = 0
 
@@ -144,15 +144,21 @@ class _SegWorker(threading.Thread):
             t0 = time.time()
             try:
                 snap = self._peek()
-                # snap = (frame, pose, depth|None, ts) из _DepthWorker
+                # snap = (frame, pose, depth|None, ts) из _DepthWorker.peek_frame
                 if snap is not None and snap[3] != self._last_frame_ts:
-                    frame = snap[0]
-                    self._last_frame_ts = snap[3]
-                    mask = self._segmenter.segment_floor(frame)
-                    if mask is not None:
-                        with self._lock:
-                            self._mask = (mask, time.time())
-                        self.inference_count += 1
+                    frame, pose, depth, frame_ts = snap
+                    self._last_frame_ts = frame_ts
+                    # Без глубины пару не собрать (slam пишет _latest даже когда
+                    # инференс глубины не дал результата) — такой кадр пропускаем.
+                    if depth is not None:
+                        mask = self._segmenter.segment_floor(frame)
+                        if mask is not None:
+                            with self._lock:
+                                # КОГЕРЕНТНАЯ пара ОДНОГО кадра (фикс B5): маска,
+                                # глубина и поза с единым frame_ts — слияние без
+                                # рассинхрона из разных кадров.
+                                self._mask = (mask, depth, pose, frame_ts)
+                            self.inference_count += 1
             except Exception as e:
                 print(f"[SegWorker] Ошибка: {type(e).__name__}: {e}")
                 self._stop_evt.wait(0.5)
@@ -160,11 +166,17 @@ class _SegWorker(threading.Thread):
             if elapsed < self._period_s:
                 self._stop_evt.wait(self._period_s - elapsed)
 
-    def latest_mask(self, max_age_s: float):
-        """Последняя маска пола, если свежее max_age_s; иначе None (→ fallback)."""
+    def latest_pair(self, max_age_s: float):
+        """
+        КОГЕРЕНТНАЯ пара кадра (mask, depth, pose, frame_ts), если кадр свежее
+        max_age_s; иначе None (→ вызывающий откатывается на legacy). Возраст
+        считается по frame_ts (момент ЗАХВАТА кадра), а НЕ по времени записи
+        маски: иначе маска старого кадра, дообработанная только что, считалась бы
+        «свежей».
+        """
         with self._lock:
-            if self._mask is not None and (time.time() - self._mask[1]) <= max_age_s:
-                return self._mask[0]
+            if self._mask is not None and (time.time() - self._mask[3]) <= max_age_s:
+                return self._mask
         return None
 
     def stop(self, timeout: float = 2.0):
@@ -370,6 +382,12 @@ class NavigationController:
         # Метка времени последнего ПОТРЕБЛЁННОГО результата фонового
         # инференса глубины (см. _DepthWorker / _update_sensors).
         self._depth_consumed_ts = 0.0
+        # Слияние seg+depth: метка кадра-ИСТОЧНИКА последней записи камерного
+        # облака в карту и кэш самого облака. Карту пишем раз на новый кадр
+        # (дедуп log-odds), а реактив каждый такт берёт облако из кэша — см.
+        # _update_sensors. (фикс B5: спаривание маски и глубины одного кадра)
+        self._fused_source_ts = None
+        self._cam_obstacles = np.zeros((0, 3), dtype=np.float32)
 
         # Отслеживание движения для одометрии
         self.current_command = "stop"  # stop, forward, forward_steer, tank, backward, rotate_left, rotate_right
@@ -451,6 +469,18 @@ class NavigationController:
     # пойдут ложные стопы, выставить CAMERA_REACTIVE_ENABLED=False без правки кода.
     CAMERA_REACTIVE_ENABLED = True
     CAMERA_REACTIVE_MIN_RANGE_M = 0.12  # шумовой порог: ближе игнорируем (артефакты)
+    # --- Свежесть лидара (детект зависшего лидара) ---
+    # get_scan() отдаёт последний оборот ВЕЧНО: при отвале порта/затыке скан
+    # «замораживается», а потребительский data_timeout SensorFusion (он считается
+    # от ЧТЕНИЯ скана, а не от публикации оборота) не срабатывает никогда — робот
+    # навигирует по застывшему снимку мира. Поэтому реактивный слой кормим сканом
+    # только если драйвер опубликовал новый оборот не дольше этого порога назад
+    # (исправный лидар даёт оборот ~каждые 0.1 с — в норме гейт не срабатывает,
+    # поведение прежнее). При превышении: скан в слияние НЕ подаём (его
+    # last_lidar_update стареет → лидар штатно выпадает по data_timeout, как
+    # камера/УЗ) + громкое предупреждение. SLAM-запись отдельно гейтится по
+    # revolution_count и при зависании сама не пишет.
+    LIDAR_STALE_AFTER_S = 1.0
     # --- Отладка камеры: сохранение кадров с маской нейронки ---
     # При включении раз в CAMERA_DEBUG_PERIOD_S в results/<запуск>/depth/ пишется
     # JPEG: слева исходный кадр, справа depth-цветом с красной маской препятствий
@@ -830,15 +860,26 @@ class NavigationController:
           # 230400 — штатная для YDLidar T-mini Plus, остальные — на случай иной прошивки.
           BAUDS = [230400, 460800, 921600, 256000, 115200]
 
-          for port in ports:
-            for baud in BAUDS:
+          # Заведомо рабочая пара (как в lidar.py): пробуем её ПЕРВОЙ. На исправном
+          # роботе старт тогда почти мгновенный — без перебора по чужим портам, где
+          # каждая неудачная пара стоит ~connect+раскрутка мотора+FRAME_WAIT_S.
+          # Полный перебор остаётся фолбэком, если порт «уплыл».
+          KNOWN_PORT, KNOWN_BAUD = '/dev/ttyUSB1', 230400
+
+          def _try_lidar(port, baud):
+              """
+              Одна попытка (порт, скорость).
+              Возвращает: 'found' — лидар найден и оставлен в self.lidar;
+                          'no_open' — порт не открылся (другие скорости не помогут);
+                          'no_data' — порт открыт, но валидных фреймов нет.
+              """
               try:
                   print(f"[NavController] Пробую лидар на {port} @ {baud}...")
                   self.lidar = LidarDriver(port=port, baudrate=baud)
 
                   if not self.lidar.connect():
                       self.lidar = None
-                      break  # порт не открылся — другие скорости не помогут
+                      return 'no_open'
 
                   self.lidar.start_scan()
 
@@ -852,11 +893,12 @@ class NavigationController:
                             f"(принято фреймов: {self.lidar.packet_count})")
                       # Отвод сырых байтов в рекордер (для тестов парсера)
                       self.lidar.set_raw_sink(self.recorder.record_lidar_raw)
-                      return
+                      return 'found'
 
                   print(f"[NavController] {port} @ {baud}: валидных фреймов лидара нет")
                   self.lidar.disconnect()
                   self.lidar = None
+                  return 'no_data'
               except Exception as e:
                   print(f"[NavController] Ошибка на {port} @ {baud}: {e}")
                   if self.lidar is not None:
@@ -865,6 +907,23 @@ class NavigationController:
                       except Exception:
                           pass
                   self.lidar = None
+                  return 'no_data'
+
+          # 1) Быстрый путь: заведомо рабочая пара.
+          if _try_lidar(KNOWN_PORT, KNOWN_BAUD) == 'found':
+              return
+
+          # 2) Фолбэк: полный перебор портов × скоростей (известную пару пропускаем —
+          # её только что проверили).
+          for port in ports:
+            for baud in BAUDS:
+              if port == KNOWN_PORT and baud == KNOWN_BAUD:
+                  continue
+              result = _try_lidar(port, baud)
+              if result == 'found':
+                  return
+              if result == 'no_open':
+                  break  # порт не открылся — другие скорости на нём не помогут
 
           print("[NavController] Не удалось подключиться к лидару")
           print("[NavController] Работа продолжится без лидара")
@@ -964,6 +1023,55 @@ class NavigationController:
             print(f"[NavController] Ошибка сенсора '{sensor}': "
                   f"{type(exc).__name__}: {exc}")
 
+    def _warn_lidar_stale(self, scan_age) -> None:
+        """
+        Громкое (троттлированное) предупреждение: лидар перестал публиковать
+        новые обороты (зависание/отвал порта/затык). Видимость отказа — главное:
+        иначе робот молча навигирует по замороженному скану. В слияние такой скан
+        мы уже не подаём (вызывающий код), и через data_timeout лидар выпадет.
+        """
+        now = time.time()
+        if now - getattr(self, '_last_lidar_stale_warn', 0.0) >= self._SENSOR_ERROR_LOG_INTERVAL_S:
+            self._last_lidar_stale_warn = now
+            age_str = f"{scan_age:.1f} с назад" if scan_age is not None else "ещё не было оборотов"
+            timeout_s = getattr(self.sensor_fusion, 'data_timeout', 2.5)
+            print(f"[NavController] ⚠ ЛИДАР МОЛЧИТ (последний оборот {age_str}): "
+                  f"новых данных нет — возможен отвал порта/затык. Перестаю обновлять "
+                  f"лидар (выпадет из слияния через ~{timeout_s:.0f} с). "
+                  f"ФРОНТ прикрыт УЗ; БОКА/ТЫЛ после выпадения станут «свободны» — осторожно.")
+
+    def _camera_fusion_decision(self, pair, fresh_depth, fresh_pose, fresh_ts):
+        """
+        Решение карто-канала камеры (фикс B5 — спаривание по кадру).
+
+        Args:
+            pair: когерентная четвёрка (mask, depth, pose, frame_ts) от
+                  _SegWorker.latest_pair, либо None (seg выкл/протух/не загрузился).
+            fresh_depth, fresh_pose, fresh_ts: самый свежий результат глубины.
+
+        Returns:
+            (write_map: bool, mask, depth, pose) — что слить в карту И в реактив:
+            - источник = пара seg (маска и глубина ИЗ ОДНОГО кадра, рассинхрона
+              нет) либо свежая глубина + floor_mask=None → legacy (контракт
+              «никогда не нет препятствий»);
+            - write_map=True только если кадр-ИСТОЧНИК новый — повторная запись
+              того же облака гонит log-odds к клампу ±5 с одного наблюдения (та
+              же причина, по которой лидар пишется лишь на новый оборот). Фиксирует
+              _fused_source_ts.
+
+        Инвариант kill-switch: при выключенном слиянии pair всегда None →
+        возвращается (True, None, fresh_depth, fresh_pose) КАЖДЫЙ depth-такт
+        (fresh_ts растёт) → путь побитово совпадает с прежним кодом.
+        """
+        if pair is not None:
+            mask, depth, pose, source_ts = pair
+        else:
+            mask, depth, pose, source_ts = None, fresh_depth, fresh_pose, fresh_ts
+        write_map = source_ts != self._fused_source_ts
+        if write_map:
+            self._fused_source_ts = source_ts
+        return write_map, mask, depth, pose
+
     def _update_sensors(self):
         """Обновление данных сенсоров.
 
@@ -987,28 +1095,34 @@ class NavigationController:
                 if result is not None:
                     frame, depth, pose, ts = result
                     self._depth_consumed_ts = ts
-                    # Слияние seg+depth: последняя маска пола из медленного
-                    # seg-потока (None если поток выкл / маска протухла / модель
-                    # недоступна → update_with_camera_depth откатится на legacy
-                    # height-filter). Это НЕ на критическом пути быстрой остановки.
-                    floor_mask = (self._seg_worker.latest_mask(
-                                      self.CAMERA_FLOOR_MASK_MAX_AGE_S)
-                                  if self._seg_worker is not None else None)
-                    # update_with_camera_depth пишет в карту (только в
-                    # mapping, и только до CAMERA_MAP_MAX_RANGE_M) и
-                    # ВОЗВРАЩАЕТ облако препятствий на всю дальность анализа —
-                    # доступно и в localization.
-                    # pose — поза НА МОМЕНТ ЗАХВАТА кадра (см. _DepthWorker).
-                    obstacles = self.slam.update_with_camera_depth(
-                        depth, self.camera_intrinsics, self.camera_mount,
-                        pixel_stride=self.CAMERA_PIXEL_STRIDE,
-                        max_range_m=self.CAMERA_MAX_RANGE_M,
-                        map_write_max_range_m=self.CAMERA_MAP_MAX_RANGE_M,
-                        robot_pose=pose,
-                        floor_mask=floor_mask,
-                        max_obstacle_height_m=self.CAMERA_MAX_OBSTACLE_HEIGHT_M,
-                        strong_obstacle_height_m=self.CAMERA_STRONG_OBSTACLE_HEIGHT_M,
-                    )
+                    # --- Карто-канал: слияние seg+depth на КОГЕРЕНТНОЙ паре ---
+                    # Маску берём ВМЕСТЕ с глубиной и позой ЕЁ ЖЕ кадра
+                    # (_SegWorker.latest_pair): (uu,vv) маски и глубины смотрят на
+                    # одну мировую точку — рассинхрона из разных кадров нет (B5).
+                    # Нет свежей пары (seg выкл/протухла/модель не загрузилась) →
+                    # сливаем СВЕЖУЮ глубину с floor_mask=None → legacy
+                    # height-filter (контракт «никогда не нет препятствий»). При
+                    # выключенном слиянии этот путь побитово совпадает с прежним.
+                    pair = (self._seg_worker.latest_pair(self.CAMERA_FLOOR_MASK_MAX_AGE_S)
+                            if self._seg_worker is not None else None)
+                    write_map, fuse_mask, fuse_depth, fuse_pose = \
+                        self._camera_fusion_decision(pair, depth, pose, ts)
+                    # Запись в карту — ОДИН раз на новый кадр-источник (дедуп выше);
+                    # облако кэшируем, реактив ниже берёт его КАЖДЫЙ такт (band/
+                    # секторы НЕ наследуют каденцию seg), сектора — по СВЕЖЕЙ позе,
+                    # проекция облака — по позе кадра fuse_pose.
+                    if write_map:
+                        self._cam_obstacles = self.slam.update_with_camera_depth(
+                            fuse_depth, self.camera_intrinsics, self.camera_mount,
+                            pixel_stride=self.CAMERA_PIXEL_STRIDE,
+                            max_range_m=self.CAMERA_MAX_RANGE_M,
+                            map_write_max_range_m=self.CAMERA_MAP_MAX_RANGE_M,
+                            robot_pose=fuse_pose,
+                            floor_mask=fuse_mask,
+                            max_obstacle_height_m=self.CAMERA_MAX_OBSTACLE_HEIGHT_M,
+                            strong_obstacle_height_m=self.CAMERA_STRONG_OBSTACLE_HEIGHT_M,
+                        )
+                    obstacles = self._cam_obstacles
                     # Реактивный слой: секторные расстояния + коридор
                     # движения из того же облака → в sensor_fusion.
                     cam_dists = None
@@ -1057,9 +1171,22 @@ class NavigationController:
             try:
                 lidar_scan = self.lidar.get_scan()
                 if lidar_scan and len(lidar_scan) > 0:
-                    # В слияние — СЫРОЙ скан: под-12см точки нужны детектору
-                    # «прижатой стены» (sensor_fusion сам их интерпретирует)
-                    self.sensor_fusion.update_lidar(lidar_scan)
+                    # Свежесть по ПРОДЮСЕРУ: драйвер штампует время каждого нового
+                    # оборота. get_scan() сам по себе отдаёт последний оборот вечно,
+                    # поэтому при зависшем лидаре нельзя кормить им реактивный слой —
+                    # иначе last_lidar_update обновлялся бы каждый такт и data_timeout
+                    # SensorFusion не сработал бы никогда (см. LIDAR_STALE_AFTER_S).
+                    scan_age = (self.lidar.seconds_since_last_scan()
+                                if hasattr(self.lidar, 'seconds_since_last_scan') else 0.0)
+                    if scan_age is not None and scan_age <= self.LIDAR_STALE_AFTER_S:
+                        # В слияние — СЫРОЙ скан: под-12см точки нужны детектору
+                        # «прижатой стены» (sensor_fusion сам их интерпретирует)
+                        self.sensor_fusion.update_lidar(lidar_scan)
+                    else:
+                        # Лидар завис: НЕ обновляем слияние — его last_lidar_update
+                        # стареет и лидар штатно выпадет по data_timeout. Громко
+                        # сигналим, чтобы отказ не был «молчащим».
+                        self._warn_lidar_stale(scan_age)
 
                     # В SLAM: только НОВЫЙ оборот (иначе один скан пишется в
                     # карту 2-3 раза до следующего оборота — насыщает log-odds
@@ -1633,8 +1760,21 @@ class NavigationController:
         # ЭКСТРЕННАЯ ОСТАНОВКА если слишком близко
         if obstacle_distance < self.critical_distance:
             self._emergency_stop_and_back()
-            self._safe_rotate(self._choose_turn_direction(), 1.0)
-            self.consecutive_rotations += 1
+            # Анти-зацикливание (раньше его здесь не было — счётчик рос, но не
+            # читался): если уже навертелись max раз подряд и всё ещё упёрты в
+            # критической зоне, крутить в ту же «свободную» сторону бессмысленно —
+            # об неё и упёрлись. Ломаем цикл разворотом в ПРОТИВОПОЛОЖНУЮ сторону,
+            # как в ветке «близко» ниже. Отдельный отъезд не нужен:
+            # _emergency_stop_and_back уже отъехал назад.
+            if self.consecutive_rotations >= self.max_consecutive_rotations:
+                print("[NAV_DEBUG] ⚠️ Зацикливание в критической зоне — разворот в обратную сторону")
+                self.consecutive_rotations = 0
+                opposite = ('right' if self._choose_turn_direction() == 'left'
+                            else 'left')
+                self._safe_rotate(opposite, 1.2)
+            else:
+                self._safe_rotate(self._choose_turn_direction(), 1.0)
+                self.consecutive_rotations += 1
             return
 
         # Проверяем расстояние для нормального движения
