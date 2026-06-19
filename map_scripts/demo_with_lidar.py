@@ -16,11 +16,13 @@ import os
 import signal
 import sys
 import time
+import traceback
 
 # Импорт из родительской директории
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from map.navigation_controller import NavigationController
+import car_adapter as ca  # для аварийной остановки моторов при сбое в такте
 
 running = True
 
@@ -38,35 +40,70 @@ def _run_loop(controller: NavigationController,
               extra_status_lines=lambda c: ()):
     """Общий главный цикл для explore и goto."""
     last_status_time = time.time()
+    consecutive_errors = 0
+    # Сколько ошибок ПОДРЯД терпим до прекращения заезда. Единичный сбой в такте
+    # (numpy/IndexError в поведении) не должен ронять всю демонстрацию, но и
+    # вечно крутить стопнутого робота на устойчивой ошибке смысла нет.
+    MAX_CONSECUTIVE_ERRORS = 10
     try:
         while running:
-            controller.update()
+            try:
+                controller.update()
 
-            current_time = time.time()
-            if current_time - last_status_time >= status_interval:
-                status = controller.get_status()
-                print("\n" + "-"*60)
-                print(f"Режим: {status['mode']}")
-                pos = status['position']
-                print(f"Позиция: x={pos[0]:.2f}м, y={pos[1]:.2f}м, θ={pos[2]:.2f}рад")
-                if status.get('obstacle_distance') is not None:
-                    print(f"Препятствие впереди: {status['obstacle_distance']:.2f}м")
-                # Метрики scan matcher — то, ради чего весь рефакторинг
-                sm = getattr(controller.slam, 'scan_matcher', None)
-                if sm is not None:
-                    stats = sm.get_stats()
-                    print(f"Scan match: {controller.slam.scan_match_accepted}/"
-                          f"{controller.slam.scan_match_total} принято "
-                          f"(reason последнего: {stats['last_reason']}, "
-                          f"iters={stats['last_iters']})")
-                for line in extra_status_lines(controller):
-                    print(line)
-                print("-"*60)
-                last_status_time = current_time
+                current_time = time.time()
+                if current_time - last_status_time >= status_interval:
+                    status = controller.get_status()
+                    print("\n" + "-"*60)
+                    print(f"Режим: {status['mode']}")
+                    pos = status['position']
+                    print(f"Позиция: x={pos[0]:.2f}м, y={pos[1]:.2f}м, θ={pos[2]:.2f}рад")
+                    if status.get('obstacle_distance') is not None:
+                        print(f"Препятствие впереди: {status['obstacle_distance']:.2f}м")
+                    # Метрики scan matcher — то, ради чего весь рефакторинг
+                    sm = getattr(controller.slam, 'scan_matcher', None)
+                    if sm is not None:
+                        stats = sm.get_stats()
+                        print(f"Scan match: {controller.slam.scan_match_accepted}/"
+                              f"{controller.slam.scan_match_total} принято "
+                              f"(reason последнего: {stats['last_reason']}, "
+                              f"iters={stats['last_iters']})")
+                    for line in extra_status_lines(controller):
+                        print(line)
+                    print("-"*60)
+                    last_status_time = current_time
 
-            if stop_when_idle and controller.get_status()['mode'] == 'idle':
-                print("\n[SUCCESS] Цель достигнута!")
-                break
+                if stop_when_idle and controller.get_status()['mode'] == 'idle':
+                    # Разводим «доехал» и «сдался»: оба ведут в IDLE, но успех
+                    # (путь пройден, navigation_controller строки 1766/1857)
+                    # ОСТАВЛЯЕТ current_goal, а _goal_unreachable в localization
+                    # его обнуляет. Без этой проверки скрипт печатал SUCCESS даже
+                    # когда цель недостижима (путь закрыт / цель в раздутой зоне) —
+                    # вплоть до SUCCESS на месте, если путь не построился сразу.
+                    if controller.get_status().get('goal') is None:
+                        print("\n[НЕ ДОСТИГНУТО] Цель недостижима — робот остановился, "
+                              "не доехав. Причина указана выше в логе.")
+                    else:
+                        print("\n[SUCCESS] Цель достигнута!")
+                    break
+
+                consecutive_errors = 0  # такт прошёл без ошибок
+            except Exception as e:
+                # КРИТИЧНО: сначала остановить моторы — иначе при сбое в такте
+                # робот продолжит выполнять последнюю команду, пока мы логируем.
+                # KeyboardInterrupt — подкласс BaseException, сюда НЕ попадает:
+                # его обрабатывает signal_handler (running=False) / внешний except.
+                try:
+                    ca.stop_robot()
+                except Exception:
+                    pass
+                consecutive_errors += 1
+                print(f"\n[ОШИБКА В ТАКТЕ #{consecutive_errors}] "
+                      f"{type(e).__name__}: {e} — робот остановлен, продолжаю.")
+                traceback.print_exc()
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    print(f"\n[СТОП] {consecutive_errors} ошибок подряд — "
+                          f"прекращаю заезд.")
+                    break
 
             time.sleep(0.05)  # 20 Hz
     except KeyboardInterrupt:
